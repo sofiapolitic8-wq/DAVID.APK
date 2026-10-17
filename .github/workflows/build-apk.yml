@@ -19,6 +19,7 @@ jobs:
     name: Build debug APK (ARM64)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -31,16 +32,16 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platform-tools
+            platforms;android-36
+            build-tools;36.0.0
+            ndk;28.2.13676358
+            cmake;3.22.1
 
-      - name: Install Android SDK, NDK and CMake
-        run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager \
-            'platform-tools' \
-            'platforms;android-36' \
-            'build-tools;36.0.0' \
-            'ndk;28.2.13676358' \
-            'cmake;3.22.1'
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses
 
       - name: Install Slang shader compiler
         shell: bash
@@ -49,29 +50,42 @@ jobs:
         run: |
           set -euo pipefail
           api='https://api.github.com/repos/shader-slang/slang/releases/latest'
-          url="$(curl --fail --silent --show-error --location -H "Authorization: Bearer $GITHUB_TOKEN" "$api" \
-            | python3 -c 'import json,sys; d=json.load(sys.stdin); a=[x["browser_download_url"] for x in d.get("assets",[]) if "linux-x86_64" in x["name"].lower() and x["name"].endswith(".tar.gz") and "debug" not in x["name"].lower()]; print(a[0] if a else "")')"
+          url="$(curl --fail --silent --show-error --location \
+            -H "Authorization: Bearer $GITHUB_TOKEN" "$api" |
+            python3 -c 'import json,sys; d=json.load(sys.stdin); a=[x["browser_download_url"] for x in d.get("assets",[]) if "linux-x86_64" in x["name"].lower() and x["name"].endswith(".tar.gz") and "debug" not in x["name"].lower()]; print(a[0] if a else "")')"
+
           if [[ -z "$url" ]]; then
-            echo 'Could not find a Linux x86_64 Slang release archive.' >&2
+            echo "Could not find Linux x86_64 Slang archive."
             exit 1
           fi
+
           mkdir -p "$RUNNER_TEMP/slang"
-          curl --fail --silent --show-error --location "$url" -o "$RUNNER_TEMP/slang.tar.gz"
+          curl --fail --silent --show-error --location "$url" \
+            -o "$RUNNER_TEMP/slang.tar.gz"
           tar -xzf "$RUNNER_TEMP/slang.tar.gz" -C "$RUNNER_TEMP/slang"
+
           slangc_path="$(find "$RUNNER_TEMP/slang" -type f -name slangc -print -quit)"
           if [[ -z "$slangc_path" ]]; then
-            echo 'slangc was not present in the downloaded archive.' >&2
-            find "$RUNNER_TEMP/slang" -maxdepth 3 -type f | head -50
+            echo "slangc was not found in the archive."
             exit 1
           fi
+
           chmod +x "$slangc_path"
           echo "$(dirname "$slangc_path")" >> "$GITHUB_PATH"
           "$slangc_path" -version
 
       - name: Validate fork configuration
         run: |
+          set -e
           test -f PRIVACY.md
-          ! grep -rIil "wyr[m]" . --exclude-dir=android-sdl --exclude-dir=glfw --exclude-dir=.git --exclude=LICENSE --exclude=NOTICE --exclude=CHANGES.txt --exclude=AboutScreen.kt | grep .
+          ! grep -rIil "wyr[m]" . \
+            --exclude-dir=android-sdl \
+            --exclude-dir=glfw \
+            --exclude-dir=.git \
+            --exclude=LICENSE \
+            --exclude=NOTICE \
+            --exclude=CHANGES.txt \
+            --exclude=AboutScreen.kt | grep .
           test -f android/gradlew
           test -f android/gradle/wrapper/gradle-wrapper.jar
           ! grep -q "com.google.gms.google-services" android/app/build.gradle
@@ -79,11 +93,8 @@ jobs:
           grep -q 'DVD_BACKEND_DISCONNECTED = true' android/app/src/main/java/io/david/mobile/data/DvdRepository.kt
           grep -q 'NICK_PREFIX = "DVDPLYER"' android/app/src/main/java/io/david/mobile/data/TeamService.kt
 
-      - name: Check game textures are present
-        run: |
-          # The engine aborts at startup if a texture is missing, so an APK built
-          # without them would install and then close. Fail here instead.
-          python3 tools/install-textures.py --check
+      - name: Check game textures
+        run: python3 tools/install-textures.py --check
 
       - name: Compile shaders
         run: python3 build.py 2
