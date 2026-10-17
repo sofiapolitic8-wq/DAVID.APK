@@ -29,18 +29,20 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          # ONE package only. This input is split on spaces, never on new lines, so a
-          # multi-line list is read as a single package name and fails with
-          # "Failed to find package". The rest is installed in the next step.
-          packages: platform-tools
-
-      - name: Install Android SDK, NDK and CMake
+      - name: Set up Android SDK (runner's preinstalled SDK, no extra action)
+        shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "SDK root: $SDK"
+          ls "$SDK" || true
+          SM="$(find "$SDK/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort | tail -n 1)"
+          if [[ -z "$SM" ]]; then echo "sdkmanager not found under $SDK/cmdline-tools" >&2; exit 1; fi
+          echo "Using $SM"
+          yes | "$SM" --sdk_root="$SDK" --licenses > /dev/null || true
+          "$SM" --sdk_root="$SDK" "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
 
       - name: Install Slang shader compiler
         shell: bash
@@ -50,14 +52,14 @@ jobs:
           set -euo pipefail
           api='https://api.github.com/repos/shader-slang/slang/releases/latest'
           url="$(curl --fail --silent --show-error --location -H "Authorization: Bearer $GITHUB_TOKEN" "$api" \
-            | python3 -c 'import json,sys; d=json.load(sys.stdin); a=[x["browser_download_url"] for x in d.get("assets",[]) if "linux-x86_64" in x["name"].lower() and x["name"].endswith(".tar.gz") and "debug" not in x["name"].lower()]; print(a[0] if a else "")')"
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); n=[(x["name"].lower(),x["browser_download_url"]) for x in d.get("assets",[])]; ok=[u for (m,u) in n if "linux-x86_64" in m and "debug" not in m and "glibc" not in m and (m.endswith(".tar.gz") or m.endswith(".zip"))] or [u for (m,u) in n if "linux-x86_64" in m and "debug" not in m and (m.endswith(".tar.gz") or m.endswith(".zip"))]; print(ok[0] if ok else "")')"
           if [[ -z "$url" ]]; then
             echo 'Could not find a Linux x86_64 Slang release archive.' >&2
             exit 1
           fi
           mkdir -p "$RUNNER_TEMP/slang"
-          curl --fail --silent --show-error --location "$url" -o "$RUNNER_TEMP/slang.tar.gz"
-          tar -xzf "$RUNNER_TEMP/slang.tar.gz" -C "$RUNNER_TEMP/slang"
+          curl --fail --silent --show-error --location "$url" -o "$RUNNER_TEMP/slang.pkg"
+          if [[ "$url" == *.zip ]]; then unzip -q "$RUNNER_TEMP/slang.pkg" -d "$RUNNER_TEMP/slang"; else tar -xzf "$RUNNER_TEMP/slang.pkg" -C "$RUNNER_TEMP/slang"; fi
           slangc_path="$(find "$RUNNER_TEMP/slang" -type f -name slangc -print -quit)"
           if [[ -z "$slangc_path" ]]; then
             echo 'slangc was not present in the downloaded archive.' >&2
