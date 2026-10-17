@@ -1,0 +1,952 @@
+package io.david.mobile.data
+
+import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+
+/** Another Dvd player's built skin, for one snake in one arena. */
+data class ArenaSkin(
+    val snakeId: Int,
+    val nickname: String,
+    val colours: IntArray,
+) {
+    override fun equals(other: Any?): Boolean =
+        other is ArenaSkin && snakeId == other.snakeId && nickname == other.nickname &&
+            colours.contentEquals(other.colours)
+
+    override fun hashCode(): Int =
+        (snakeId * 31 + nickname.hashCode()) * 31 + colours.contentHashCode()
+}
+
+data class RenameAllowance(
+    val displayName: Int = 2,
+    val username: Int = 2,
+)
+
+data class ApiPlayer(
+    val id: String,
+    val ingameName: String? = null,
+    val username: String? = null,
+    val displayName: String,
+    val avatarKey: String = "mono-ink",
+    /** Absolute, and empty when the player has no photograph. */
+    val avatarUrl: String = "",
+    val bio: String = "",
+    val highestScore: Long = 0,
+    val kills: Long = 0,
+    val followerCount: Long = 0,
+    val followingCount: Long = 0,
+    val createdAt: String = "",
+    /** Set on a closed account. The row stays; the screens say so. */
+    val deletedAt: String = "",
+    /** Where the viewer stands with this player, as the server sees it. */
+    val isFollowing: Boolean = false,
+    val followsYou: Boolean = false,
+    /** Direct messages need both people to follow each other. */
+    val canMessage: Boolean = false,
+    /** "Show my activity to friends" (2026-10-09); only /v1/me says it. */
+    val shareActivity: Boolean = true,
+) {
+    val isDeleted: Boolean get() = deletedAt.isNotEmpty()
+    val handle: String get() = if (username.isNullOrBlank()) "" else "@$username"
+}
+
+/**
+ * One line of chat, global or direct.
+ *
+ * Direct messages carry no author block — a thread has exactly two people in
+ * it and the screen already knows both — so [authorId] alone decides which
+ * side of the thread a line belongs on.
+ */
+data class ChatMessage(
+    val id: String,
+    val body: String,
+    val createdAt: String,
+    val authorId: String,
+    val authorName: String,
+    val authorUsername: String,
+    val authorAvatarUrl: String,
+    val authorAvatarKey: String,
+    val authorDeleted: Boolean = false,
+)
+
+/** A finished run waiting for the account backend to acknowledge it. */
+data class PendingRun(
+    val eventId: String,
+    val playerId: String,
+    val score: Int,
+    val kills: Int,
+    /** How long the run lasted, -1 unknown (runs queued before 2026-10-09). */
+    val durationMs: Long = -1,
+    /** The arena ("ip:port") it was played in; blank for Play with AI or unknown. */
+    val arena: String = "",
+) {
+    /** The body /v1/me/stats takes; length and arena only when known. */
+    fun toStatsJson(): JSONObject = JSONObject()
+        .put("eventId", eventId)
+        .put("score", score)
+        .put("kills", kills)
+        .apply {
+            if (durationMs >= 0) put("durationMs", durationMs.coerceAtMost(24L * 3_600_000L))
+            if (ArenaDirectory.isValidEndpoint(arena)) put("arena", arena)
+        }
+}
+
+/**
+ * A mutual follow's activity (OM, 2026-10-09; backend `presence.mjs`):
+ * online (the app open on screen), the arena they play in, or the last one
+ * they played in and when. Only for friends who share it, and only while you
+ * share yours.
+ */
+data class FriendActivity(
+    val playerId: String,
+    val online: Boolean,
+    /** "playing", "online", "idle" or "offline". */
+    val state: String,
+    val arena: String?,
+    val sinceMs: Long?,
+    val lastArena: String?,
+    val lastPlayedAtMs: Long?,
+    /** When this phone fetched it, so "12 min" keeps counting between fetches. */
+    val fetchedAt: Long,
+) {
+    val playing: Boolean get() = online && state == "playing" && !arena.isNullOrBlank()
+
+    fun sinceNow(now: Long = System.currentTimeMillis()): Long? = sinceMs?.let { it + (now - fetchedAt) }
+}
+
+data class Conversation(
+    val player: ApiPlayer,
+    val lastMessage: String,
+    val lastAt: String,
+    val unread: Long,
+)
+
+/** One entry in the alerts panel — a broadcast, exactly as the operator sent it. */
+data class ServerNotification(
+    val id: String,
+    val kind: String,
+    val title: String,
+    val body: String,
+    val meta: Map<String, String>,
+    val createdAt: String,
+    val read: Boolean,
+)
+
+internal class ApiException(
+    val status: Int,
+    message: String,
+    /** Seconds from a 429's Retry-After, 0 when the server gave none. */
+    val retryAfterSeconds: Int = 0,
+) : Exception(message)
+
+/* Diagnostic kill switch. While true every backend call fails like a network
+   outage (IOException, never 401), so the saved session stays signed in and
+   runs stay queued. Normally false. */
+internal const val DVD_BACKEND_DISCONNECTED = true
+
+class DvdRepository(context: Context, baseUrl: String) {
+    private val appContext = context.applicationContext
+    private val api = baseUrl.trimEnd('/')
+    private val prefs = appContext.getSharedPreferences("dvd_session", Context.MODE_PRIVATE)
+
+    val hasSession: Boolean get() = session != null
+
+    private var session: String?
+        get() = prefs.getString("token", null)
+        set(value) {
+            prefs.edit().apply {
+                if (value == null) remove("token") else putString("token", value)
+            }.apply()
+        }
+
+    suspend fun googleSignIn(idToken: String): ApiPlayer = withContext(Dispatchers.IO) {
+        val response = call(
+            path = "/v1/auth/google",
+            method = "POST",
+            body = JSONObject().put("idToken", idToken),
+            authenticated = false,
+        )
+        session = response.getString("token")
+        response.getJSONObject("player").toPlayer(api)
+    }
+
+    /**
+     * An account with no Google behind it.
+     *
+     * The username is the identity, so it is what signs you back in later.
+     * There is no email and therefore no way to send a reset — the screen that
+     * calls this says so before the password is chosen, not afterwards.
+     */
+    suspend fun guestSignUp(
+        displayName: String,
+        username: String,
+        password: String,
+    ): ApiPlayer = withContext(Dispatchers.IO) {
+        val response = call(
+            path = "/v1/auth/guest",
+            method = "POST",
+            body = JSONObject()
+                .put("displayName", displayName)
+                .put("username", username)
+                .put("password", password),
+            authenticated = false,
+        )
+        session = response.getString("token")
+        response.getJSONObject("player").toPlayer(api)
+    }
+
+    /** Whether a username is still free, asked before the password is chosen. */
+    suspend fun usernameAvailable(username: String): Boolean = withContext(Dispatchers.IO) {
+        call(
+            path = "/v1/auth/username-availability?username=" + java.net.URLEncoder.encode(username, "UTF-8"),
+            authenticated = false,
+        ).getBoolean("available")
+    }
+
+    suspend fun logIn(username: String, password: String): ApiPlayer = withContext(Dispatchers.IO) {
+        val response = call(
+            path = "/v1/auth/login",
+            method = "POST",
+            body = JSONObject().put("username", username).put("password", password),
+            authenticated = false,
+        )
+        session = response.getString("token")
+        response.getJSONObject("player").toPlayer(api)
+    }
+
+    suspend fun me(): ApiPlayer = withContext(Dispatchers.IO) {
+        call("/v1/me").toPlayer(api)
+    }
+
+    /** How many display-name and username changes remain in the 30-day window. */
+    suspend fun renameAllowance(): RenameAllowance = withContext(Dispatchers.IO) {
+        val json = call("/v1/me/renames")
+        RenameAllowance(
+            displayName = json.optInt("displayName", 2),
+            username = json.optInt("username", 2),
+        )
+    }
+
+    /**
+     * Writes whatever the caller passes and leaves the rest alone.
+     *
+     * Every field is optional on the server too, so an edit screen can send only
+     * what changed. The server owns the rules — a name it rejects comes back as
+     * an [ApiError] carrying its own code, which the screens show verbatim
+     * rather than second-guessing with a local copy of the same regex.
+     */
+    suspend fun updateProfile(
+        displayName: String? = null,
+        ingameName: String? = null,
+        username: String? = null,
+        bio: String? = null,
+        avatarKey: String? = null,
+        phoneNumber: String? = null,
+    ): ApiPlayer = withContext(Dispatchers.IO) {
+        val body = JSONObject()
+        displayName?.let { body.put("displayName", it) }
+        ingameName?.let { body.put("ingameName", it) }
+        username?.let { body.put("username", it) }
+        bio?.let { body.put("bio", it) }
+        avatarKey?.let { body.put("avatarKey", it) }
+        phoneNumber?.let { body.put("phoneNumber", it) }
+        call("/v1/me", method = "PATCH", body = body).toPlayer(api)
+    }
+
+    /**
+     * Reports one finished run.
+     *
+     * [eventId] makes it idempotent, so a retry after a dropped connection
+     * cannot count the same match twice. The server keeps the best score and
+     * adds the kills, exactly as it does for its own game-server route.
+     */
+    /**
+     * Tell other Dvd players what this snake looks like, for this arena only.
+     *
+     * The arena carries colour-group indices and has no field for an exact
+     * colour, so a skin built in the picker can only reach anyone through here.
+     */
+    suspend fun publishArenaSkin(
+        arena: String,
+        snakeId: Int,
+        nickname: String,
+        code: String,
+        colours: IntArray,
+        generation: String,
+    ): Unit = withContext(Dispatchers.IO) {
+        call(
+            path = "/v1/arena/skin",
+            method = "POST",
+            body = JSONObject()
+                .put("arena", arena)
+                .put("snakeId", snakeId)
+                .put("nickname", nickname)
+                .put("code", code)
+                .put("colours", colours.joinToString("") { "%08X".format(it) })
+                .put("generation", generation),
+        )
+        Unit
+    }
+
+    /** On the way Home, or on leaving the arena. */
+    suspend fun clearArenaSkin(generation: String): Unit = withContext(Dispatchers.IO) {
+        call(
+            path = "/v1/arena/skin",
+            method = "DELETE",
+            body = JSONObject().put("generation", generation),
+        )
+        Unit
+    }
+
+    /** One batched question for every snake the viewport has just met. */
+    suspend fun arenaSkins(arena: String, snakeIds: List<Int>): List<ArenaSkin> =
+        withContext(Dispatchers.IO) {
+            val response = call(
+                path = "/v1/arena/skins",
+                method = "POST",
+                body = JSONObject()
+                    .put("arena", arena)
+                    .put("snakeIds", JSONArray(snakeIds)),
+            )
+            val rows = response.optJSONArray("skins")
+            buildList {
+                for (index in 0 until (rows?.length() ?: 0)) {
+                    val row = rows!!.getJSONObject(index)
+                    val hex = row.optString("colours")
+                    add(
+                        ArenaSkin(
+                            snakeId = row.optInt("snakeId", -1),
+                            nickname = row.optString("nickname"),
+                            colours = IntArray(hex.length / 8) {
+                                hex.substring(it * 8, it * 8 + 8).toLong(16).toInt()
+                            },
+                        )
+                    )
+                }
+            }
+        }
+
+    suspend fun reportRun(run: PendingRun): List<ServerNotification> = withContext(Dispatchers.IO) {
+        val response = call(
+            path = "/v1/me/stats",
+            method = "POST",
+            body = run.toStatsJson(),
+        )
+        val earned = response.optJSONArray("achievements")
+        buildList {
+            for (index in 0 until (earned?.length() ?: 0)) {
+                add(earned!!.getJSONObject(index).toServerNotification())
+            }
+        }
+    }
+
+    /**
+     * Up to 25 queued runs in one request, applied in order by the server
+     * exactly as [reportRun] would (2026-10-08). Returns the event ids the
+     * server answered for, plus every achievement earned. A server without
+     * the route answers 404; the caller then sends them one by one.
+     */
+    suspend fun reportRuns(runs: List<PendingRun>): Pair<List<String>, List<ServerNotification>> =
+        withContext(Dispatchers.IO) {
+            val body = JSONObject().put("runs", JSONArray().apply {
+                runs.forEach { put(it.toStatsJson()) }
+            })
+            val response = call(path = "/v1/me/stats/batch", method = "POST", body = body)
+            val results = response.optJSONArray("results")
+            val done = buildList {
+                for (index in 0 until (results?.length() ?: 0)) {
+                    results!!.optJSONObject(index)?.optString("eventId")?.takeIf { it.isNotBlank() }?.let(::add)
+                }
+            }
+            val earned = response.optJSONArray("achievements")
+            done to buildList {
+                for (index in 0 until (earned?.length() ?: 0)) {
+                    add(earned!!.getJSONObject(index).toServerNotification())
+                }
+            }
+        }
+
+    /** Idempotent recovery from absolute device totals; it never lowers server data. */
+    suspend fun reconcileStats(highestScore: Long, kills: Long): ApiPlayer = withContext(Dispatchers.IO) {
+        call(
+            path = "/v1/me/stats/reconcile",
+            method = "POST",
+            body = JSONObject()
+                .put("highestScore", highestScore.coerceAtLeast(0L))
+                .put("kills", kills.coerceAtLeast(0L)),
+        ).getJSONObject("player").toPlayer(api)
+    }
+
+    /** [sort] is "score" or "kills"; the server ranks, this only reads. */
+    suspend fun leaderboard(sort: String): List<ApiPlayer> = withContext(Dispatchers.IO) {
+        val players = call("/v1/leaderboard?sort=$sort").optJSONArray("players")
+        buildList {
+            for (index in 0 until (players?.length() ?: 0)) {
+                val player = players!!.getJSONObject(index).toPlayer(api)
+                // During a rolling backend update an older node can still
+                // return tombstones. Never flash those rows in the app.
+                if (!player.isDeleted) add(player)
+            }
+        }
+    }
+
+    /**
+     * Replaces the player's photograph.
+     *
+     * The image goes up as itself rather than as base64 inside JSON — a third
+     * fewer bytes over a phone connection, and the server stores exactly what
+     * it receives.
+     */
+    suspend fun uploadAvatar(bytes: ByteArray): ApiPlayer = withContext(Dispatchers.IO) {
+        callBinary("/v1/me/avatar", "PUT", "image/jpeg", bytes).toPlayer(api)
+    }
+
+    /* ---------------------------------------------------------- trails */
+
+    suspend fun trails(cursor: String?, author: String? = null): TrailPage = withContext(Dispatchers.IO) {
+        val query = buildString {
+            // Ten a page (OM, 2026-10-05: Instagram-light): videos cost more than photos.
+            append(if (author == null) "/v1/trails?limit=10" else "/v1/trails?limit=20")
+            cursor?.let { append("&cursor=").append(java.net.URLEncoder.encode(it, "UTF-8")) }
+            author?.let { append("&author=").append(it) }
+        }
+        val response = call(query)
+        val rows = response.optJSONArray("trails")
+        TrailPage(
+            trails = (0 until (rows?.length() ?: 0)).map { rows!!.getJSONObject(it).toTrail(api) },
+            nextCursor = response.optString("nextCursor").takeIf { it.isNotBlank() && it != "null" },
+        )
+    }
+
+    suspend fun trail(id: String): Trail = withContext(Dispatchers.IO) {
+        call("/v1/trails/$id").getJSONObject("trail").toTrail(api)
+    }
+
+    /** One JPEG, already resized in the app; `progress` runs 0..1 as it goes up. */
+    suspend fun uploadTrailMedia(bytes: ByteArray, progress: (Float) -> Unit): String = withContext(Dispatchers.IO) {
+        callBinary("/v1/trails/media", "PUT", "image/jpeg", bytes, progress).getString("id")
+    }
+
+    /**
+     * One trail video (OM, 2026-10-05): the MP4 the app already trimmed and
+     * compressed (at most 30 s, 720p, 16 MB), sent as itself. The server checks
+     * its boxes and moves its index to the front for streaming.
+     */
+    suspend fun uploadTrailVideo(file: java.io.File, progress: (Float) -> Unit): String = withContext(Dispatchers.IO) {
+        callBinary("/v1/trails/video", "PUT", "video/mp4", file.readBytes(), progress).getString("id")
+    }
+
+    /**
+     * A photo trail with both ids, or a text trail with neither. A video trail
+     * also carries [videoId], its photo and thumb being the poster. A shared run
+     * also says whether the poster's skin goes with it ([shareSkin]); the skin
+     * itself is sent only when it does. Other posts send neither field.
+     */
+    suspend fun createTrail(
+        caption: String,
+        photoId: String?,
+        thumbId: String?,
+        skin: TrailSkin? = null,
+        shareSkin: Boolean? = null,
+        videoId: String? = null,
+    ): Trail = withContext(Dispatchers.IO) {
+        val body = JSONObject().put("caption", caption)
+        if (photoId != null && thumbId != null) body.put("photoId", photoId).put("thumbId", thumbId)
+        if (videoId != null) body.put("videoId", videoId)
+        if (shareSkin != null) body.put("shareSkin", shareSkin)
+        if (shareSkin == true && skin != null) body.put("skin", skin.toJson())
+        call("/v1/trails", method = "POST", body = body).getJSONObject("trail").toTrail(api)
+    }
+
+    suspend fun likeTrail(id: String, liked: Boolean): TrailLike = withContext(Dispatchers.IO) {
+        val response = call("/v1/trails/$id/like", method = if (liked) "PUT" else "DELETE")
+        TrailLike(response.optBoolean("liked"), response.optInt("likeCount"))
+    }
+
+    suspend fun deleteTrail(id: String) = withContext(Dispatchers.IO) {
+        call("/v1/trails/$id", method = "DELETE")
+        Unit
+    }
+
+    suspend fun reportTrail(id: String, reason: String) = withContext(Dispatchers.IO) {
+        call("/v1/trails/$id/report", method = "POST", body = JSONObject().put("reason", reason))
+        Unit
+    }
+
+    suspend fun trailComments(id: String): TrailCommentPage = withContext(Dispatchers.IO) {
+        val response = call("/v1/trails/$id/comments?limit=40")
+        val rows = response.optJSONArray("comments")
+        TrailCommentPage(
+            comments = (0 until (rows?.length() ?: 0)).map { rows!!.getJSONObject(it).toTrailComment(api) },
+            nextCursor = response.optString("nextCursor").takeIf { it.isNotBlank() && it != "null" },
+        )
+    }
+
+    suspend fun replyToTrail(id: String, body: String): TrailReply = withContext(Dispatchers.IO) {
+        val response = call("/v1/trails/$id/comments", method = "POST", body = JSONObject().put("body", body))
+        TrailReply(response.getJSONObject("comment").toTrailComment(api), response.optInt("commentCount"))
+    }
+
+    suspend fun deleteTrailReply(id: String, commentId: String) = withContext(Dispatchers.IO) {
+        call("/v1/trails/$id/comments/$commentId", method = "DELETE")
+        Unit
+    }
+
+    /** Back to a drawn avatar. */
+    suspend fun removeAvatar(): ApiPlayer = withContext(Dispatchers.IO) {
+        call("/v1/me/avatar", method = "DELETE").toPlayer(api)
+    }
+
+    /**
+     * Closes the account.
+     *
+     * A soft delete on the server: the row survives so that anything the player
+     * touched — leaderboard history, chat, follows — still resolves to a name
+     * instead of a dangling id, and shows as deleted. Signing in with the same
+     * Google account afterwards starts a fresh account rather than resurrecting
+     * this one.
+     */
+    suspend fun deleteAccount() = withContext(Dispatchers.IO) {
+        call("/v1/me", method = "DELETE")
+        Unit
+    }
+
+    /* ------------------------------------------------- badges and support */
+
+    /** The ten profile badges (`backend/src/badges.mjs`). */
+    /**
+     * Friends' activity (2026-10-09): `sharing` is false when this account has
+     * "Show my activity to friends" off, and then the list is empty too.
+     */
+    suspend fun friendsPresence(): Pair<Boolean, List<FriendActivity>> = withContext(Dispatchers.IO) {
+        val json = call("/v1/friends/presence")
+        val now = System.currentTimeMillis()
+        val rows = json.optJSONArray("friends")
+        json.optBoolean("sharing", true) to buildList {
+            for (index in 0 until (rows?.length() ?: 0)) {
+                val row = rows!!.optJSONObject(index) ?: continue
+                val id = row.optString("playerId").takeIf { it.isNotBlank() } ?: continue
+                fun text(key: String) = row.optString(key).takeIf { it.isNotBlank() && it != "null" }
+                add(FriendActivity(
+                    playerId = id,
+                    online = row.optBoolean("online", false),
+                    state = row.optString("state", "offline"),
+                    arena = text("arena"),
+                    sinceMs = if (row.isNull("sinceMs")) null else row.optLong("sinceMs"),
+                    lastArena = text("lastArena"),
+                    lastPlayedAtMs = text("lastPlayedAt")?.let {
+                        runCatching { java.time.Instant.parse(it).toEpochMilli() }.getOrNull()
+                    },
+                    fetchedAt = now,
+                ))
+            }
+        }
+    }
+
+    /** Turns "Show my activity to friends" on or off for the account. */
+    suspend fun setActivitySharing(share: Boolean): Boolean = withContext(Dispatchers.IO) {
+        call("/v1/me/activity-sharing", method = "PUT", body = JSONObject().put("share", share))
+            .optBoolean("shareActivity", share)
+    }
+
+    suspend fun badges(id: String): BadgeBook = withContext(Dispatchers.IO) {
+        call("/v1/players/$id/badges").toBadgeBook()
+    }
+
+    /** A Help & feedback report or a crash report. Signed in or not. */
+    suspend fun submitSupport(
+        kind: String,
+        message: String,
+        context: Map<String, String>,
+        stack: String = "",
+        logs: String = "",
+    ): String = withContext(Dispatchers.IO) {
+        val body = JSONObject()
+            .put("kind", kind)
+            .put("message", message.take(4000))
+            .put("context", JSONObject(context.mapValues { it.value.take(300) }.entries.take(40).associate { it.key to it.value }))
+        if (stack.isNotBlank()) body.put("stack", SupportRedact.clean(stack).takeLast(60_000))
+        if (logs.isNotBlank()) body.put("logs", SupportRedact.clean(logs).takeLast(120_000))
+        call("/v1/support/reports", method = "POST", body = body).optString("id")
+    }
+
+    suspend fun mySupport(): List<SupportReport> = withContext(Dispatchers.IO) {
+        val rows = call("/v1/me/support").optJSONArray("reports")
+        (0 until (rows?.length() ?: 0)).map { rows!!.getJSONObject(it).toSupportReport() }
+    }
+
+    /* -------------------------------------------------------------- social */
+
+    /** Another player, as everyone else sees them, plus where you stand. */
+    suspend fun player(id: String): ApiPlayer = withContext(Dispatchers.IO) {
+        call("/v1/players/$id").toPlayer(api)
+    }
+
+    suspend fun setFollow(id: String, following: Boolean): ApiPlayer = withContext(Dispatchers.IO) {
+        call("/v1/players/$id/follow", method = if (following) "PUT" else "DELETE").toPlayer(api)
+    }
+
+    /** [kind] is "followers" or "following". */
+    suspend fun connections(id: String, kind: String): List<ApiPlayer> = withContext(Dispatchers.IO) {
+        call("/v1/players/$id/connections?kind=$kind").players(api)
+    }
+
+    suspend fun searchPlayers(query: String): List<ApiPlayer> = withContext(Dispatchers.IO) {
+        call("/v1/players?q=${java.net.URLEncoder.encode(query, "UTF-8")}").players(api)
+    }
+
+    /* ---------------------------------------------------------------- chat */
+
+    suspend fun globalMessages(): List<ChatMessage> = withContext(Dispatchers.IO) {
+        call("/v1/chat/messages").messages(api)
+    }
+
+    suspend fun sendGlobal(body: String): Unit = withContext(Dispatchers.IO) {
+        call("/v1/chat/messages", method = "POST", body = JSONObject().put("body", body))
+        Unit
+    }
+
+    suspend fun deleteChatMessage(id: String, direct: Boolean): Unit = withContext(Dispatchers.IO) {
+        call(if (direct) "/v1/direct/messages/$id" else "/v1/chat/messages/$id", method = "DELETE")
+        Unit
+    }
+
+    suspend fun reportMessage(id: String, reason: String): Unit = withContext(Dispatchers.IO) {
+        call(
+            "/v1/chat/messages/$id/report",
+            method = "POST",
+            body = JSONObject().put("reason", reason),
+        )
+        Unit
+    }
+
+    /** Everyone you have exchanged direct messages with, most recent first. */
+    suspend fun conversations(): List<Conversation> = withContext(Dispatchers.IO) {
+        val array = call("/v1/direct").optJSONArray("conversations")
+        buildList {
+            for (index in 0 until (array?.length() ?: 0)) {
+                val row = array!!.getJSONObject(index)
+                add(
+                    Conversation(
+                        player = row.getJSONObject("player").toPlayer(api),
+                        lastMessage = row.optString("lastMessage", ""),
+                        lastAt = row.optString("lastAt", ""),
+                        unread = row.optLong("unreadCount", 0),
+                    )
+                )
+            }
+        }
+    }
+
+    suspend fun directMessages(playerId: String): List<ChatMessage> = withContext(Dispatchers.IO) {
+        val response = call("/v1/direct/$playerId/messages")
+        val array = response.optJSONArray("messages")
+        buildList {
+            for (index in 0 until (array?.length() ?: 0)) {
+                val row = array!!.getJSONObject(index)
+                add(
+                    ChatMessage(
+                        id = row.optString("id"),
+                        body = row.optString("body"),
+                        createdAt = row.optString("createdAt"),
+                        authorId = row.optString("senderId"),
+                        authorName = "",
+                        authorUsername = "",
+                        authorAvatarUrl = "",
+                        authorAvatarKey = "mono-ink",
+                    )
+                )
+            }
+        }
+    }
+
+    suspend fun sendDirect(playerId: String, body: String): Unit = withContext(Dispatchers.IO) {
+        call(
+            "/v1/direct/$playerId/messages",
+            method = "POST",
+            body = JSONObject().put("body", body),
+        )
+        Unit
+    }
+
+    /**
+     * Hands the phone's push token to the backend.
+     *
+     * Called once after sign-in and again whenever Firebase issues a new one —
+     * a token can change on its own, and a stale one just means a push nobody
+     * reads rather than an error, so this is fire-and-forget by design.
+     */
+    suspend fun registerDeviceToken(token: String): Unit = withContext(Dispatchers.IO) {
+        call(
+            "/v1/me/device-token",
+            method = "POST",
+            body = JSONObject().put("token", token),
+        )
+        Unit
+    }
+
+    /** Log out: this phone stops receiving the account's pushes. */
+    suspend fun forgetDeviceToken(token: String): Unit = withContext(Dispatchers.IO) {
+        call("/v1/me/device-token/forget", method = "POST", body = JSONObject().put("token", token))
+        Unit
+    }
+
+    /**
+     * The account's settings for this platform plus the shared copy (skin, look,
+     * arena background, name). Either is null when nothing was ever saved.
+     */
+    suspend fun accountSettings(platform: String): Pair<JSONObject?, JSONObject?> = withContext(Dispatchers.IO) {
+        val body = call("/v1/me/settings/$platform")
+        body.optJSONObject("platform")?.optJSONObject("doc") to body.optJSONObject("shared")?.optJSONObject("doc")
+    }
+
+    /** Replaces the account's copy for this platform (and the shared one). */
+    suspend fun saveAccountSettings(platform: String, doc: JSONObject, shared: JSONObject?): Unit = withContext(Dispatchers.IO) {
+        val body = JSONObject().put("doc", doc).put("appVersion", io.david.mobile.BuildConfig.VERSION_NAME)
+        if (shared != null) body.put("shared", shared)
+        call("/v1/me/settings/$platform", method = "PUT", body = body)
+        Unit
+    }
+
+    /** The alerts panel's feed: every broadcast, marked against this player's own read point. */
+    suspend fun notifications(): List<ServerNotification> = withContext(Dispatchers.IO) {
+        val array = call("/v1/notifications").optJSONArray("notifications")
+        buildList {
+            for (index in 0 until (array?.length() ?: 0)) {
+                add(array!!.getJSONObject(index).toServerNotification())
+            }
+        }
+    }
+
+    suspend fun markNotificationsRead(): Unit = withContext(Dispatchers.IO) {
+        call("/v1/notifications/read", method = "POST")
+        Unit
+    }
+
+    suspend fun setNotificationRead(id: String, read: Boolean): Unit = withContext(Dispatchers.IO) {
+        call(
+            "/v1/notifications/$id/read",
+            method = "PUT",
+            body = JSONObject().put("read", read),
+        )
+        Unit
+    }
+
+    suspend fun deleteNotification(id: String): Unit = withContext(Dispatchers.IO) {
+        call("/v1/notifications/$id", method = "DELETE")
+        Unit
+    }
+
+    /** The server's own error code, so screens report the real reason. */
+    fun errorCode(error: Throwable): String =
+        (error as? ApiException)?.message.orEmpty()
+
+    fun isUnauthorized(error: Throwable): Boolean =
+        error is ApiException && error.status == HttpURLConnection.HTTP_UNAUTHORIZED
+
+    fun isRateLimited(error: Throwable): Boolean = error is ApiException && error.status == 429
+
+    /**
+     * Set by any 429: until then, background refreshes (after a run, the
+     * hourly board, avatar prefetch) stay quiet and screens keep what they
+     * show. A player's own action (a pull, a send) still goes through.
+     */
+    @Volatile var quietUntil: Long = 0L
+        private set
+
+    val shouldStayQuiet: Boolean get() = System.currentTimeMillis() < quietUntil
+
+    /** How long to wait after [error]: the server's Retry-After if it gave one. */
+    fun retryDelayMs(error: Throwable, fallbackMs: Long): Long {
+        val seconds = (error as? ApiException)?.retryAfterSeconds ?: 0
+        return if (seconds > 0) seconds * 1000L else fallbackMs
+    }
+
+    suspend fun signOut() {
+        session = null
+        runCatching { clearGoogleCredentials(appContext) }
+    }
+
+    fun clearSession() {
+        session = null
+    }
+
+    fun close() = Unit
+
+    private fun JSONObject.toServerNotification(): ServerNotification {
+        val metaObject = optJSONObject("meta")
+        val meta = buildMap {
+            metaObject?.keys()?.forEach { key -> put(key, metaObject.optString(key)) }
+        }
+        return ServerNotification(
+            id = optString("id"),
+            kind = optString("kind", "broadcast"),
+            title = optString("title"),
+            body = optString("body"),
+            meta = meta,
+            createdAt = optString("createdAt"),
+            read = optBoolean("read", false),
+        )
+    }
+
+    private fun call(
+        path: String,
+        method: String = "GET",
+        body: JSONObject? = null,
+        authenticated: Boolean = true,
+    ): JSONObject {
+        if (DVD_BACKEND_DISCONNECTED) throw java.io.IOException("david.io backend disconnected")
+        val connection = (URL("$api$path").openConnection() as HttpURLConnection).apply {
+            requestMethod = method
+            connectTimeout = 12_000
+            readTimeout = 15_000
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("skip_zrok_interstitial", "1")
+            if (authenticated) session?.let { setRequestProperty("Authorization", "Bearer $it") }
+            if (body != null) {
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+            }
+        }
+        return try {
+            if (body != null) {
+                connection.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(body.toString()) }
+            }
+            val status = connection.responseCode
+            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
+            val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            if (status !in 200..299) {
+                val message = runCatching { JSONObject(text).optString("error") }.getOrNull()
+                    ?.takeIf { it.isNotBlank() } ?: "HTTP_$status"
+                // Only the rate limiter sends Retry-After; a business 429
+                // (NAME_CHANGE_LIMIT) has none and must not quiet the app.
+                val retryAfter = if (status == 429) {
+                    connection.getHeaderField("Retry-After")?.trim()?.toIntOrNull()?.coerceIn(1, 600) ?: 0
+                } else 0
+                if (retryAfter > 0) {
+                    quietUntil = maxOf(quietUntil, System.currentTimeMillis() + retryAfter * 1000L)
+                }
+                throw ApiException(status, message, retryAfter)
+            }
+            // A 204, or any success with nothing to say, is still a success.
+            if (text.isBlank()) JSONObject() else JSONObject(text)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    /** The same call, with bytes for a body instead of a document. */
+    private fun callBinary(
+        path: String,
+        method: String,
+        contentType: String,
+        body: ByteArray,
+        progress: ((Float) -> Unit)? = null,
+    ): JSONObject {
+        if (DVD_BACKEND_DISCONNECTED) throw java.io.IOException("david.io backend disconnected")
+        val connection = (URL("$api$path").openConnection() as HttpURLConnection).apply {
+            requestMethod = method
+            connectTimeout = 15_000
+            readTimeout = 30_000
+            doOutput = true
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("skip_zrok_interstitial", "1")
+            setRequestProperty("Content-Type", contentType)
+            setFixedLengthStreamingMode(body.size)
+            session?.let { setRequestProperty("Authorization", "Bearer $it") }
+        }
+        return try {
+            connection.outputStream.use { out ->
+                // In slices, so an upload can say how far it has got.
+                var sent = 0
+                while (sent < body.size) {
+                    val next = minOf(body.size, sent + 16 * 1024)
+                    out.write(body, sent, next - sent)
+                    sent = next
+                    progress?.invoke(sent.toFloat() / body.size)
+                }
+            }
+            val status = connection.responseCode
+            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
+            val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            if (status !in 200..299) {
+                val message = runCatching { JSONObject(text).optString("error") }.getOrNull()
+                    ?.takeIf { it.isNotBlank() } ?: "HTTP_$status"
+                throw ApiException(status, message)
+            }
+            if (text.isBlank()) JSONObject() else JSONObject(text)
+        } finally {
+            connection.disconnect()
+        }
+    }
+}
+
+/**
+ * [base] resolves the avatar address.
+ *
+ * The server returns its own avatars as a path rather than a full address, so
+ * that the same database works behind any hostname; a Google picture arrives
+ * absolute and is left exactly as it is.
+ */
+private fun JSONObject.toPlayer(base: String) = ApiPlayer(
+    id = getString("id"),
+    ingameName = optString("ingameName").takeIf { it.isNotBlank() && it != "null" },
+    username = optString("username").takeIf { it.isNotBlank() && it != "null" },
+    displayName = optString("displayName", "Unnamed"),
+    avatarKey = optString("avatarKey", "mono-ink"),
+    avatarUrl = optString("avatarUrl").orEmptyish().let {
+        if (it.startsWith("/")) "$base$it" else it
+    },
+    bio = optString("bio", ""),
+    highestScore = optLong("highestScore", 0),
+    kills = optLong("kills", 0),
+    followerCount = optLong("followerCount", 0),
+    followingCount = optLong("followingCount", 0),
+    createdAt = optString("createdAt", ""),
+    deletedAt = optString("deletedAt").orEmptyish(),
+    isFollowing = optBoolean("isFollowing", false),
+    followsYou = optBoolean("followsYou", false),
+    canMessage = optBoolean("canMessage", false),
+    shareActivity = optBoolean("shareActivity", true),
+)
+
+private fun JSONObject.players(base: String): List<ApiPlayer> {
+    val array = optJSONArray("players")
+    return buildList {
+        for (index in 0 until (array?.length() ?: 0)) {
+            add(array!!.getJSONObject(index).toPlayer(base))
+        }
+    }
+}
+
+private fun JSONObject.messages(base: String): List<ChatMessage> {
+    val array = optJSONArray("messages")
+    return buildList {
+        for (index in 0 until (array?.length() ?: 0)) {
+            val row = array!!.getJSONObject(index)
+            val avatar = row.optString("avatarUrl").orEmptyish()
+            add(
+                ChatMessage(
+                    id = row.optString("id"),
+                    body = row.optString("body"),
+                    createdAt = row.optString("createdAt"),
+                    authorId = row.optString("playerId"),
+                    authorName = row.optString("displayName", "Unnamed"),
+                    authorUsername = row.optString("username").orEmptyish(),
+                    authorAvatarUrl = if (avatar.startsWith("/")) "$base$avatar" else avatar,
+                    authorAvatarKey = row.optString("avatarKey", "mono-ink"),
+                    authorDeleted = row.optString("deletedAt").orEmptyish().isNotEmpty(),
+                )
+            )
+        }
+    }
+}
+
+/** org.json turns a JSON null into the four characters "null". */
+private fun String?.orEmptyish(): String =
+    if (this.isNullOrBlank() || this == "null") "" else this

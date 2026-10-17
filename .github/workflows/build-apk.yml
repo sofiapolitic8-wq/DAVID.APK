@@ -1,0 +1,115 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build debug APK (ARM64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK, NDK and CMake
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            'platform-tools' \
+            'platforms;android-36' \
+            'build-tools;36.0.0' \
+            'ndk;28.2.13676358' \
+            'cmake;3.22.1'
+
+      - name: Install Slang shader compiler
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api='https://api.github.com/repos/shader-slang/slang/releases/latest'
+          url="$(curl --fail --silent --show-error --location -H "Authorization: Bearer $GITHUB_TOKEN" "$api" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); a=[x["browser_download_url"] for x in d.get("assets",[]) if "linux-x86_64" in x["name"].lower() and x["name"].endswith(".tar.gz") and "debug" not in x["name"].lower()]; print(a[0] if a else "")')"
+          if [[ -z "$url" ]]; then
+            echo 'Could not find a Linux x86_64 Slang release archive.' >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/slang"
+          curl --fail --silent --show-error --location "$url" -o "$RUNNER_TEMP/slang.tar.gz"
+          tar -xzf "$RUNNER_TEMP/slang.tar.gz" -C "$RUNNER_TEMP/slang"
+          slangc_path="$(find "$RUNNER_TEMP/slang" -type f -name slangc -print -quit)"
+          if [[ -z "$slangc_path" ]]; then
+            echo 'slangc was not present in the downloaded archive.' >&2
+            find "$RUNNER_TEMP/slang" -maxdepth 3 -type f | head -50
+            exit 1
+          fi
+          chmod +x "$slangc_path"
+          echo "$(dirname "$slangc_path")" >> "$GITHUB_PATH"
+          "$slangc_path" -version
+
+      - name: Validate fork configuration
+        run: |
+          test -f PRIVACY.md
+          ! grep -rIil "wyr[m]" . --exclude-dir=android-sdl --exclude-dir=glfw --exclude-dir=.git --exclude=LICENSE --exclude=NOTICE --exclude=CHANGES.txt --exclude=AboutScreen.kt | grep .
+          test -f android/gradlew
+          test -f android/gradle/wrapper/gradle-wrapper.jar
+          ! grep -q "com.google.gms.google-services" android/app/build.gradle
+          ! grep -q "com.google.firebase" android/app/build.gradle
+          grep -q 'DVD_BACKEND_DISCONNECTED = true' android/app/src/main/java/io/david/mobile/data/DvdRepository.kt
+          grep -q 'NICK_PREFIX = "DVDPLYER"' android/app/src/main/java/io/david/mobile/data/TeamService.kt
+
+      - name: Check game textures are present
+        run: |
+          # The engine aborts at startup if a texture is missing, so an APK built
+          # without them would install and then close. Fail here instead.
+          python3 tools/install-textures.py --check
+
+      - name: Compile shaders
+        run: python3 build.py 2
+
+      - name: Build debug APK
+        working-directory: android
+        env:
+          JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace :app:assembleDebug \
+            -PDVD_VERSION_CODE=1 \
+            -PDVD_VERSION_NAME=1.0.0
+
+      - name: Verify APK output
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk='android/app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$apk"
+          ls -lh "$apk"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: davidio-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,90 @@
+HANDOFF - david.io mobile (status 2026-10-17, second pass)
+=============================================
+
+WHAT IS DONE (static edits only; nothing has been compiled or run on a device)
+- Rebrand to david.io / io.david.mobile, original "d" icon and mark, no upstream backend, Firebase,
+  update channel, payment or contact details. Details: CHANGES.txt.
+- Start on Home with no login; tabs Play / Skin / Settings; Settings trimmed.
+- TeamService / TeamScreen / DvdOverlay own-team flow, invite paste fix, 8-char nick prefix.
+- server/server.js tested in Node (10/10: create, two simulated phones, roster, chat, minimap
+  coordinates, wrong key, player limit, info, groups, rename).
+- GitHub Actions workflow builds a debug APK (.github/workflows/build-apk.yml).
+
+BLOCKERS / WHAT THE OWNER MUST SUPPLY
+1. Textures: DONE (2026-10-17). app/res/textures/ is now filled (22 files, 11 MB) and
+   `python3 tools/install-textures.py --check` reports 0 missing. Everything is rebuilt by
+     python3 tools/make-textures.py            (needs Pillow + numpy)
+   - 8 arena floors from the david.io extension (tools/ext-art/bg: bg45, dd, greenlava, grid,
+     mars, metalgrid, noise, redlava) + background_4k.png (bg54) -> Hex slate, Flowers, Green
+     lava, Grid, Mars, Metal grid, Noise, Red lava. Each is declared as a 4096 x 3548 tile so it
+     draws at the extension's 599-unit size. Table is backgrounds.h = SkinCatalog.kt =
+     BackgroundsTab.kt = ui_overlay.c = tassets.c (18 entries: 0 david.io, 1 None, 2-9 extension,
+     10 Black, 11-17 generated dvd_* tiles).
+   - 32 accessories in tex_atlas_8k.png come from the extension's s/a_*.webp (tools/ext-art).
+   - Drawn from scratch (original, procedural): sprite atlas beads/shadows/cursor/54 patterned
+     beads, arrow_skins.png (20), dvd_accessories.png (hair, ears, glasses), home icons,
+     dvd_logo.png ("DAVID.IO"), air_colour_wheel.png. dvd_tags.png comes from
+     tools/dvd-tag-append.py (tag tables verified byte-identical).
+   - Looks are NOT checked on a device: accessory scale/offset in the atlas is an estimate (the
+     engine's per-item sc/of values were tuned for upstream art). Adjust in make_textures_core.py.
+   - Rights: the 9 jpgs and 32 webps are the NTL MOD extension's files. Use them only if you
+     have the right to (the extension manifest names [NTL] as author).
+2. First real compile. Never built. Expect some Kotlin/Java compile errors in the edited files
+   (DvdOverlay.kt, TeamScreen.kt, HomeScreen.kt, SettingsScreen.kt, TeamService.kt,
+   DvdMessagingService.java). Read the Actions log and fix; do not redesign.
+
+NOT DONE
+- Engine extras (NOT done, never compiled; they change the persisted settings struct and need a
+  post-process pass, so do them after the first successful build): Eyes Back, Spine and head-dot size ALREADY exist in the engine (game/input.c,
+  platform/android_settings.c) with an on-screen Eyes Back key. Missing: Center Eyes, Brightness,
+  Saturation, absolute food-dot size (0.2..8 px). The logic for Center Eyes is in the extension's
+  main-mt.js (NTL_EC), which was never supplied. Brightness/Saturation in the extension are CSS
+  filters (60..140 %); in Vulkan they need a post-process or colour multiplier.
+- Account-backed screens (social, trails, voice, profile, support) are unreachable but their code
+  is still in the tree; delete them once the app builds.
+- Gameplay (steering, boost, bots), the Vulkan path and the two-phone team test were not run.
+
+PRIVACY NOTE
+While playing online the engine opens ws://ws.ntl-slither.com:9000 (NTL tag network) and sends
+nickname, arena, snake id, skin and position about once a second (app/src/network/ntl_net.c).
+PRIVACY.md says so. Consider making it opt-in.
+
+LICENSE
+GNU GPL v3: keep LICENSE, NOTICE and CHANGES.txt, and publish the source with any APK.
+
+
+SECOND PASS (2026-10-17) - what was completed after the first handoff
+---------------------------------------------------------------------
+1. JPGS = david.io. All NINE floors of the david.io extension (bg45, bg54, dd, greenlava, grid, mars,
+   metalgrid, noise, redlava) are in app/res/textures/backgrounds/ BYTE-IDENTICAL to the extension's files
+   (checked file by file). bg54.jpg is now arena floor 0 ("david.io") directly; the re-encoded
+   background_4k.png is gone. Updated together: backgrounds.h, renderer.c fallback, SkinCatalog.kt,
+   BackgroundsTab.kt, tassets.c, make-textures.py (copies jpgs verbatim), optimize_mobile_textures.py.
+   `python3 tools/install-textures.py --check` -> 22 required, 0 missing.
+2. SHADERS (would have crashed at startup): the fork had lost app/res/shaders/src/bd.slang and bg.slang,
+   so build.py never produced bdv/bdf/bgv/bgf.spv although the engine loads them. Restored both
+   (unchanged upstream sources). Engine loads 16 .spv = tassets.c lists 16 = build.py builds 16.
+3. PRIVACY: the NTL tag network (ws://ws.ntl-slither.com:9000) is now OFF by default. ntl_net_tick()
+   returns before connecting unless built with DVD_NTL_TAG_NETWORK=1 (CMake cache variable at the top of
+   android/app/jni/CMakeLists.txt). PRIVACY.md updated. Team mode / flags lookup to ntl-slither.com are
+   unchanged (see PRIVACY.md).
+4. FOOD (david.io extension look): new installs get small plain white food (uniform colour white,
+   size 0.4, no flicker, no drift). The Food size slider now reaches 0.1 (was 0.25) in
+   android_settings.c and in the restore check in android_update.c. Saved settings are not touched.
+   No struct change, so no settings migration.
+5. .gitignore added (the upstream one also ignored every *.md, which would have dropped PRIVACY.md and
+   broken the CI "Validate fork configuration" step).
+6. Static checks run (no compiler for Kotlin/Java/Android here): JNI export names vs native methods,
+   manifest components, imports, R.* resources (lucide icons come from the icons-lucide library),
+   stale Firebase/upstream references: nothing found. gcc -fsyntax-only on ui_overlay.c, redraw.c,
+   game_data.c, user_settings.c, ntl_net.c (0 and 1): clean. The CI validate step was simulated locally: pass.
+
+STILL NOT DONE (needs a real build first, then device testing)
+- First compile of Kotlin/Java/NDK (GitHub Actions: Actions tab -> Build Android APK -> Run workflow).
+- Engine extras that change the persisted settings struct: Center Eyes (logic = NTL_EC in the extension's
+  main-mt.js), Brightness, Saturation (needs a post-process or colour multiplier). Do them after the
+  first successful build and append fields to user_settings_ext (offsetof serialisation, see user_settings.c).
+- Absolute food-dot size in px (0.2..8) as in the extension: the engine's Food size is a multiplier
+  (0.1..3); tune on a device.
+- Remove the unreachable account / social / trails / voice screens once it builds.
+- Looks tuning (accessory scale/offset) and the whole gameplay / two-phone team test on a phone.

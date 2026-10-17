@@ -1,0 +1,1400 @@
+package io.david.mobile.ui
+
+import android.os.Build
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.RoundRect
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Outline
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import io.david.mobile.data.ApiPlayer
+import io.david.mobile.data.ChatMessage
+import io.david.mobile.data.Conversation
+import io.david.mobile.data.FriendActivity
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.text.DateFormat
+import java.text.NumberFormat
+import java.time.Instant
+import java.util.Date
+import java.util.Locale
+
+/*
+ * Social, as Dvd iOS draws it (DvdDesignDetails.swift, DvdSocialExtras.swift,
+ * DvdChatUI.swift): Leaderboard, Messages, a direct thread, Global chat,
+ * Connections, Profile and Edit profile. Every page sits in the same chrome —
+ * "‹ Back", a centred title, an optional action — and pulls to refresh.
+ */
+
+private fun groupedNumber(value: Long): String = NumberFormat.getIntegerInstance(Locale.US).format(value)
+
+private fun initialsOf(name: String): String {
+    val letters = name.split(" ").filter { it.isNotBlank() }.take(2).mapNotNull { it.firstOrNull()?.toString() }.joinToString("").uppercase()
+    return letters.ifEmpty { "W" }
+}
+
+/** Global chat's refusals, worded as on iOS. */
+fun iosChatError(code: String): String = when (code) {
+    "PROFILE_INCOMPLETE" -> "Choose a username or arena name before chatting."
+    "MESSAGE_RATE_LIMITED" -> "Slow down a little — try again in a moment."
+    "INVALID_MESSAGE" -> "That message could not be sent."
+    else -> code
+}
+
+/* ---------------------------------------------------------------- chrome */
+
+/**
+ * Dvd Desktop shows these pages inside its own sections, under its own
+ * header, so it turns the phone's "Back · Title" bar off. Android never sets
+ * it (2026-10-12).
+ */
+val LocalPageChromeHidden = androidx.compose.runtime.staticCompositionLocalOf { false }
+
+@Composable
+fun IosPageChrome(
+    title: String,
+    insetTop: Dp,
+    onBack: () -> Unit,
+    actionTitle: String = "",
+    onAction: (() -> Unit)? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    if (LocalPageChromeHidden.current) {
+        Column(Modifier.fillMaxSize().padding(top = insetTop)) { content() }
+        return
+    }
+    Column(Modifier.fillMaxSize().background(Dvd.Paper).padding(top = insetTop)) {
+        Box(Modifier.fillMaxWidth().height(52.dp).background(Dvd.Paper).padding(horizontal = 18.dp)) {
+            Row(
+                Modifier
+                    .align(Alignment.CenterStart)
+                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onBack),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                IosIcon(IosGlyph.CHEVRON_LEFT, Dvd.Link, size = 15.dp, weight = 2.6f)
+                Text("Back", fontFamily = Dvd.Body, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Dvd.Link)
+            }
+            Text(
+                title,
+                fontFamily = Dvd.Body,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 16.sp,
+                color = Dvd.Ink,
+                maxLines = 1,
+                modifier = Modifier.align(Alignment.Center).padding(horizontal = 80.dp),
+            )
+            if (actionTitle.isNotEmpty()) {
+                Text(
+                    actionTitle,
+                    fontFamily = Dvd.Body,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp,
+                    color = Dvd.Link,
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onAction?.invoke() },
+                )
+            }
+        }
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Dvd.Rule))
+        content()
+    }
+}
+
+/* ----------------------------------------------------------- leaderboard */
+
+@Composable
+fun IosLeaderboardScreen(
+    score: List<ApiPlayer>,
+    kills: List<ApiPlayer>,
+    sort: Int,
+    refreshing: Boolean,
+    insetTop: Dp,
+    insetBottom: Dp,
+    onSort: (Int) -> Unit,
+    onRefresh: () -> Unit,
+    onBack: () -> Unit,
+    onOpenPlayer: (String) -> Unit,
+) {
+    val rows = if (sort == 0) score else kills
+    var query by remember { mutableStateOf("") }
+    // Keep the real rank: searching narrows the list, it does not re-rank it.
+    val shown = remember(rows, query) {
+        rows.withIndex().filter { (_, player) -> leaderboardMatches(player, query) }
+    }
+    IosPageChrome("Leaderboard", insetTop, onBack) {
+        IosRefreshable(refreshing, onRefresh, Modifier.weight(1f)) {
+            // Lazy: only the rows on screen are built, so switching boards is instant.
+            LazyColumn(Modifier.fillMaxSize()) {
+                item(key = "sort") {
+                    LiquidSegmented(listOf("Score", "Kills"), sort, onSort, Modifier.padding(16.dp).fillMaxWidth())
+                }
+                if (rows.isNotEmpty()) {
+                    item(key = "search") {
+                        SettingsSearchField(query, { query = it }, placeholder = "Name, @username, score or kills")
+                    }
+                }
+                if (rows.isEmpty()) {
+                    item(key = "empty") { IosPaperCard { IosEmptyPanel("No ranked players yet", "Finished runs will appear here.") } }
+                } else if (shown.isEmpty()) {
+                    item(key = "no-match") { IosPaperCard { IosEmptyPanel("No one found", "Nobody on this board matches “${query.trim()}”.") } }
+                }
+                itemsIndexed(shown, key = { _, row -> "$sort-${row.value.id}" }) { index, row ->
+                    val player = row.value
+                    Box(Modifier.padding(horizontal = 16.dp).cardSegment(first = index == 0, last = index == shown.lastIndex)) {
+                        PlayerRankRow(row.index + 1, player, if (sort == 0) player.highestScore else player.kills) { onOpenPlayer(player.id) }
+                    }
+                }
+                item(key = "end") { Spacer(Modifier.height(24.dp + insetBottom)) }
+            }
+        }
+    }
+}
+
+/**
+ * Leaderboard search (same rules as iOS `dvdLeaderboardMatches`): every word
+ * must hit one of name, @username, in-game name, score or kills. A number is
+ * matched against the digits of score and kills, so "1,500" finds 1500.
+ */
+internal fun leaderboardMatches(player: ApiPlayer, query: String): Boolean {
+    val words = query.lowercase().split(' ').map { it.trim() }.filter { it.isNotEmpty() }
+    if (words.isEmpty()) return true
+    val names = listOf(player.displayName, player.username.orEmpty(), player.ingameName.orEmpty()).map { it.lowercase() }
+    val numbers = listOf(player.highestScore.toString(), player.kills.toString())
+    return words.all { word ->
+        val bare = word.removePrefix("@")
+        val digits = word.filter { it.isDigit() }
+        val numeric = digits.isNotEmpty() && word.all { it.isDigit() || it == ',' || it == '.' }
+        (bare.isNotEmpty() && names.any { bare in it }) || (numeric && numbers.any { digits in it })
+    }
+}
+
+/** One slice of a DvdPaperCard, so a lazy list can still read as one card. */
+private fun Modifier.cardSegment(first: Boolean, last: Boolean): Modifier = this.drawWithContent {
+    val r = 17.dp.toPx()
+    val stroke = 1.dp.toPx()
+    val top = if (first) r else 0f
+    val bottom = if (last) r else 0f
+    val shape = androidx.compose.ui.geometry.RoundRect(
+        0f, 0f, size.width, size.height,
+        topLeftCornerRadius = CornerRadius(top), topRightCornerRadius = CornerRadius(top),
+        bottomRightCornerRadius = CornerRadius(bottom), bottomLeftCornerRadius = CornerRadius(bottom),
+    )
+    val path = Path().apply { addRoundRect(shape) }
+    drawPath(path, Dvd.Card.copy(alpha = 0.92f))
+    clipPath(path) { this@drawWithContent.drawContent() }
+    // The rule: both sides always, the top on the first slice, the bottom on the last.
+    val half = stroke / 2f
+    val outline = Path().apply {
+        addRoundRect(
+            androidx.compose.ui.geometry.RoundRect(
+                half, if (first) half else -stroke, size.width - half, if (last) size.height - half else size.height + stroke,
+                topLeftCornerRadius = CornerRadius(top), topRightCornerRadius = CornerRadius(top),
+                bottomRightCornerRadius = CornerRadius(bottom), bottomLeftCornerRadius = CornerRadius(bottom),
+            ),
+        )
+    }
+    clipRect(0f, 0f, size.width, size.height) {
+        drawPath(outline, Dvd.Rule, style = androidx.compose.ui.graphics.drawscope.Stroke(stroke))
+    }
+}
+
+@Composable
+private fun PlayerRankRow(rank: Int, player: ApiPlayer, value: Long, onClick: () -> Unit) {
+    Box {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 56.dp)
+                .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onClick)
+                .padding(horizontal = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("$rank", fontFamily = Dvd.Body, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Dvd.Quiet,
+                textAlign = TextAlign.Center, modifier = Modifier.width(24.dp))
+            DvdAvatar(player.avatarUrl, player.avatarKey, initialsOf(player.displayName), 35.dp)
+            PersonText(player.displayName, player.handle, Modifier.weight(1f))
+            Text(groupedNumber(value), fontFamily = Dvd.Body, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Dvd.Ink)
+        }
+        RowRule(58.dp, Modifier.align(Alignment.BottomStart))
+    }
+}
+
+@Composable
+private fun PersonText(
+    name: String,
+    handle: String,
+    modifier: Modifier = Modifier,
+    activity: FriendActivity? = null,
+    onJoin: ((String) -> Unit)? = null,
+) {
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(name, fontFamily = Dvd.Body, fontWeight = FontWeight.SemiBold, fontSize = 14.5.sp, color = Dvd.Ink, maxLines = 1)
+        val shows = activity != null && (activity.online || activity.lastArena != null)
+        if (shows) FriendActivityLine(activity, fontSize = 11.sp, onJoin = onJoin)
+        else if (handle.isNotEmpty()) Text(handle, fontFamily = Dvd.Body, fontSize = 10.5.sp, color = Dvd.Quiet, maxLines = 1)
+    }
+}
+
+@Composable
+private fun RowRule(start: Dp, modifier: Modifier = Modifier) {
+    Box(modifier.padding(start = start).fillMaxWidth().height(1.dp).background(Dvd.RowRule))
+}
+
+/* -------------------------------------------------------------- messages */
+
+@Composable
+fun IosMessagesScreen(
+    conversations: List<Conversation>,
+    candidates: List<ApiPlayer>,
+    refreshing: Boolean,
+    insetTop: Dp,
+    insetBottom: Dp,
+    onRefresh: () -> Unit,
+    onBack: () -> Unit,
+    onOpenThread: (ApiPlayer) -> Unit,
+    /** Friends' activity (2026-10-09): online dot and "Playing in …" with Join. */
+    activityOf: (String) -> FriendActivity? = { null },
+    onJoin: ((String) -> Unit)? = null,
+) {
+    IosPageChrome("Messages", insetTop, onBack) {
+        IosRefreshable(refreshing, onRefresh, Modifier.weight(1f)) {
+            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                IosSectionLabel("Conversations")
+                IosPaperCard {
+                    if (conversations.isEmpty()) IosEmptyPanel("No messages yet", "Mutual follows can start a private conversation.")
+                    // Instagram's inbox (2026-10-09): their face (green dot while
+                    // Dvd is open), name, the last message or the arena they play in.
+                    conversations.forEachIndexed { index, row ->
+                        if (index > 0) RowRule(start = 70.dp)
+                        val activity = activityOf(row.player.id)
+                        val unread = row.unread > 0
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 64.dp)
+                                .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onOpenThread(row.player) }
+                                .padding(horizontal = 14.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            DvdAvatar(row.player.avatarUrl, row.player.avatarKey, initialsOf(row.player.displayName), 44.dp,
+                                online = activity?.online == true)
+                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(row.player.displayName, fontFamily = Dvd.Body,
+                                    fontWeight = if (unread) FontWeight.Bold else FontWeight.SemiBold,
+                                    fontSize = 15.sp, color = Dvd.Ink, maxLines = 1)
+                                if (activity?.playing == true) FriendActivityLine(activity, fontSize = 11.5.sp, onJoin = onJoin)
+                                else Text(
+                                    row.lastMessage.ifEmpty { "No messages yet" },
+                                    fontFamily = Dvd.Body, fontSize = 12.5.sp,
+                                    fontWeight = if (unread) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = if (unread) Dvd.Ink else Dvd.Quiet,
+                                    maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                )
+                            }
+                            DvdCountBadge(row.unread.toInt())
+                        }
+                    }
+                }
+                if (candidates.isNotEmpty()) {
+                    IosSectionLabel("People you can message")
+                    IosPaperCard {
+                        candidates.forEach { person ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 56.dp)
+                                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onOpenThread(person) }
+                                    .padding(horizontal = 14.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                val activity = activityOf(person.id)
+                                DvdAvatar(person.avatarUrl, person.avatarKey, initialsOf(person.displayName), 35.dp,
+                                    online = activity?.online == true)
+                                PersonText(person.displayName, person.handle, Modifier.weight(1f), activity, onJoin)
+                                IosIcon(IosGlyph.MESSAGE, Dvd.Link, size = 20.dp)
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(24.dp + insetBottom))
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------ chat pages */
+
+/**
+ * A direct conversation laid out like Instagram's (OM, 2026-10-09): the other
+ * player's face and name in the bar, their profile card at the head of the
+ * thread (alone when nothing has been said yet), their face beside the last
+ * bubble of each of their runs, and the time between runs far apart. Dvd's
+ * colours, not Instagram's. Same as Dvd iOS's `DvdThreadDetail`.
+ */
+@Composable
+fun IosThreadScreen(
+    title: String,
+    messages: List<ChatMessage>,
+    meId: String,
+    draft: String,
+    sending: Boolean,
+    error: String,
+    insetTop: Dp,
+    insetBottom: Dp,
+    onDraftChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onBack: () -> Unit,
+    peer: ApiPlayer? = null,
+    onPeer: () -> Unit = {},
+    /** The other player's activity (2026-10-09), "Active now" / "Playing in …" + Join. */
+    activity: FriendActivity? = null,
+    onJoin: ((String) -> Unit)? = null,
+    onDelete: ((ChatMessage) -> Unit)? = null,
+) {
+    Column(Modifier.fillMaxSize().background(Dvd.Paper).padding(top = insetTop)) {
+        Row(
+            Modifier.fillMaxWidth().height(58.dp).background(Dvd.Paper).padding(horizontal = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                Modifier
+                    .size(width = 36.dp, height = 44.dp)
+                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onBack),
+                contentAlignment = Alignment.Center,
+            ) {
+                IosIcon(IosGlyph.CHEVRON_LEFT, Dvd.Ink, size = 18.dp, weight = 2.6f)
+            }
+            Row(
+                Modifier.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onPeer),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                DvdAvatar(
+                    url = peer?.avatarUrl.orEmpty(),
+                    avatarKey = peer?.avatarKey ?: "mono-ink",
+                    initial = initialsOf(peer?.displayName ?: title),
+                    size = 34.dp,
+                    online = activity?.online == true,
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                    Text(peer?.displayName ?: title, fontFamily = Dvd.Body, fontWeight = FontWeight.Bold, fontSize = 15.5.sp,
+                        color = Dvd.Ink, maxLines = 1)
+                    val handle = peer?.username.orEmpty()
+                    if (activity != null && (activity.online || activity.lastArena != null)) {
+                        FriendActivityLine(activity, fontSize = 11.5.sp, onJoin = onJoin)
+                    } else if (handle.isNotEmpty()) {
+                        Text("@$handle", fontFamily = Dvd.Body, fontSize = 11.5.sp, color = Dvd.Quiet, maxLines = 1)
+                    }
+                }
+            }
+        }
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Dvd.Rule))
+        IosChatPage(
+            messages = messages,
+            meId = meId,
+            showsAuthors = false,
+            emptyTitle = "Quiet so far",
+            emptyNote = "Say hello when you are ready.",
+            error = error,
+            draft = draft,
+            placeholder = "Message…",
+            limit = 1000,
+            sending = sending,
+            insetBottom = insetBottom,
+            onDraftChange = onDraftChange,
+            onSend = onSend,
+            peer = peer,
+            onPeer = onPeer,
+            direct = true,
+            onDelete = onDelete,
+        )
+    }
+}
+
+/** The other player at the head of a direct thread (Instagram's empty chat). */
+@Composable
+private fun DirectIntro(peer: ApiPlayer?, onPeer: () -> Unit) {
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        DvdAvatar(
+            url = peer?.avatarUrl.orEmpty(),
+            avatarKey = peer?.avatarKey ?: "mono-ink",
+            initial = initialsOf(peer?.displayName ?: ""),
+            size = 92.dp,
+            modifier = Modifier.padding(bottom = 6.dp),
+        )
+        Text(peer?.displayName.orEmpty(), fontFamily = Dvd.Body, fontWeight = FontWeight.Bold, fontSize = 18.sp, color = Dvd.Ink, maxLines = 1)
+        val handle = peer?.username.orEmpty()
+        if (handle.isNotEmpty()) Text("@$handle", fontFamily = Dvd.Body, fontSize = 13.sp, color = Dvd.Quiet)
+        if (peer != null) {
+            Text("${compactCount(peer.followerCount)} followers · david.io", fontFamily = Dvd.Body, fontSize = 12.sp, color = Dvd.Quiet)
+            when {
+                peer.isFollowing && peer.followsYou ->
+                    Text("You follow each other on david.io", fontFamily = Dvd.Body, fontSize = 12.sp, color = Dvd.Quiet)
+                peer.followsYou -> Text("Follows you", fontFamily = Dvd.Body, fontSize = 12.sp, color = Dvd.Quiet)
+            }
+        }
+        Text(
+            "View profile",
+            fontFamily = Dvd.Body,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 13.sp,
+            color = Dvd.Ink,
+            modifier = Modifier
+                .padding(top = 9.dp)
+                .clip(DvdCapsule)
+                .background(Dvd.Track)
+                .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onPeer)
+                .padding(horizontal = 16.dp, vertical = 7.dp),
+        )
+    }
+}
+
+private fun compactCount(value: Long): String = when {
+    value >= 1_000_000 -> "%.1fM".format(value / 1_000_000.0).replace(".0M", "M")
+    value >= 10_000 -> "${value / 1000}K"
+    value >= 1_000 -> "%.1fK".format(value / 1_000.0).replace(".0K", "K")
+    else -> value.toString()
+}
+
+private fun parseInstant(raw: String): java.time.Instant? = runCatching { java.time.Instant.parse(raw) }.getOrNull()
+
+/** Runs an hour apart are separate runs, as on Instagram. */
+private fun farApart(first: ChatMessage?, second: ChatMessage?): Boolean {
+    val a = first?.let { parseInstant(it.createdAt) } ?: return false
+    val b = second?.let { parseInstant(it.createdAt) } ?: return false
+    return b.epochSecond - a.epochSecond > 3600
+}
+
+/** "Today 3:45 PM", "Yesterday 9:10 AM", "Mon 3:45 PM" or "12 Oct 3:45 PM". */
+private fun separatorLabel(message: ChatMessage, previous: ChatMessage?): String? {
+    val now = parseInstant(message.createdAt) ?: return null
+    if (previous != null) {
+        val before = parseInstant(previous.createdAt)
+        if (before != null && now.epochSecond - before.epochSecond <= 3600) return null
+    }
+    val zone = java.time.ZoneId.systemDefault()
+    val time = now.atZone(zone)
+    val clock = java.time.format.DateTimeFormatter.ofLocalizedTime(java.time.format.FormatStyle.SHORT).format(time)
+    val days = java.time.temporal.ChronoUnit.DAYS.between(time.toLocalDate(), java.time.LocalDate.now(zone))
+    val day = when {
+        days == 0L -> "Today"
+        days == 1L -> "Yesterday"
+        days < 7L -> java.time.format.DateTimeFormatter.ofPattern("EEE").format(time)
+        else -> java.time.format.DateTimeFormatter.ofPattern("d MMM").format(time)
+    }
+    return "$day $clock"
+}
+
+@Composable
+fun IosGlobalChatScreen(
+    messages: List<ChatMessage>,
+    meId: String,
+    draft: String,
+    sending: Boolean,
+    error: String,
+    insetTop: Dp,
+    insetBottom: Dp,
+    onDraftChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onBack: () -> Unit,
+    onOpenAuthor: (String) -> Unit,
+    onReport: (ChatMessage, String) -> Unit,
+    onDelete: ((ChatMessage) -> Unit)? = null,
+) {
+    var reporting by remember { mutableStateOf<ChatMessage?>(null) }
+    Box(Modifier.fillMaxSize()) {
+        IosPageChrome("Global chat", insetTop, onBack) {
+            IosChatPage(
+                messages = messages,
+                meId = meId,
+                showsAuthors = true,
+                emptyTitle = "Quiet right now",
+                emptyNote = "Messages stay here for 24 hours. Say hello.",
+                error = error,
+                draft = draft,
+                placeholder = "Message everyone",
+                limit = 280,
+                sending = sending,
+                insetBottom = insetBottom,
+                onDraftChange = onDraftChange,
+                onSend = onSend,
+                onAuthor = onOpenAuthor,
+                onReport = { reporting = it },
+                onDelete = onDelete,
+            )
+        }
+        reporting?.let { message ->
+            IosActionSheet(
+                title = "Report message",
+                actions = listOf("Spam", "Harassment or abuse", "Hate or slurs", "Something else").map { reason ->
+                    IosSheetAction(reason) { onReport(message, reason) }
+                },
+                insetBottom = insetBottom,
+                onDismiss = { reporting = null },
+            )
+        }
+    }
+}
+
+@Composable
+internal fun ColumnScope.IosChatPage(
+    messages: List<ChatMessage>,
+    meId: String,
+    showsAuthors: Boolean,
+    emptyTitle: String,
+    emptyNote: String,
+    error: String,
+    draft: String,
+    placeholder: String,
+    limit: Int,
+    sending: Boolean,
+    insetBottom: Dp,
+    onDraftChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onAuthor: ((String) -> Unit)? = null,
+    onReport: ((ChatMessage) -> Unit)? = null,
+    peer: ApiPlayer? = null,
+    onPeer: () -> Unit = {},
+    direct: Boolean = false,
+    onDelete: ((ChatMessage) -> Unit)? = null,
+) {
+    val backdrop = rememberLayerBackdrop()
+    val imeUp = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    Column(Modifier.weight(1f).fillMaxWidth().imePadding()) {
+        Box(Modifier.weight(1f).fillMaxWidth().layerBackdrop(backdrop)) {
+            IosChatTranscript(messages, meId, showsAuthors, emptyTitle, emptyNote, onAuthor, onReport, peer, onPeer, direct, onDelete)
+        }
+        AnimatedVisibility(error.isNotEmpty(), enter = fadeIn(), exit = fadeOut()) {
+            Text(
+                error,
+                fontFamily = Dvd.Body,
+                fontSize = 11.5.sp,
+                color = Dvd.Badge,
+                modifier = Modifier.fillMaxWidth().background(Dvd.Paper).padding(horizontal = 18.dp, vertical = 6.dp),
+            )
+        }
+        IosChatComposer(
+            text = draft,
+            onText = onDraftChange,
+            placeholder = placeholder,
+            limit = limit,
+            sending = sending,
+            bottomInset = if (imeUp) 0.dp else insetBottom,
+            backdrop = backdrop,
+            onSend = onSend,
+        )
+    }
+}
+
+/**
+ * `DvdChatTranscript`: consecutive messages from one author share a name
+ * line and tighten into a run; the last of a run carries its time. New
+ * bubbles spring in from their author's corner and the list follows them.
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun IosChatTranscript(
+    messages: List<ChatMessage>,
+    meId: String,
+    showsAuthors: Boolean,
+    emptyTitle: String,
+    emptyNote: String,
+    onAuthor: ((String) -> Unit)?,
+    onReport: ((ChatMessage) -> Unit)?,
+    peer: ApiPlayer? = null,
+    onPeer: () -> Unit = {},
+    direct: Boolean = false,
+    onDelete: ((ChatMessage) -> Unit)? = null,
+) {
+    val listState = rememberLazyListState()
+    val seen = remember { mutableSetOf<String>() }
+    val firstLoad = remember { mutableStateOf(true) }
+    val imeBottom = WindowInsets.ime.getBottom(LocalDensity.current)
+    LaunchedEffect(messages.lastOrNull()?.id) {
+        if (messages.isEmpty()) return@LaunchedEffect
+        if (firstLoad.value) {
+            listState.scrollToItem(messages.size)
+            messages.forEach { seen += it.id }
+            firstLoad.value = false
+        } else {
+            listState.animateScrollToItem(messages.size)
+        }
+    }
+    LaunchedEffect(imeBottom > 0) { if (imeBottom > 0 && messages.isNotEmpty()) listState.animateScrollToItem(messages.size) }
+
+    LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(top = 10.dp)) {
+        if (direct) {
+            item(key = "direct-intro") {
+                Box(Modifier.padding(top = if (messages.isEmpty()) 44.dp else 12.dp, bottom = 10.dp)) { DirectIntro(peer, onPeer) }
+            }
+        } else if (messages.isEmpty()) {
+            item { Box(Modifier.padding(top = 18.dp)) { IosPaperCard { IosEmptyPanel(emptyTitle, emptyNote) } } }
+        }
+        itemsIndexed(messages, key = { _, m -> m.id }) { index, message ->
+            val previous = messages.getOrNull(index - 1)
+            val next = messages.getOrNull(index + 1)
+            val fresh = message.id !in seen && !firstLoad.value
+            val mine = message.authorId == meId
+            val endsGroup = next?.authorId != message.authorId || (direct && farApart(message, next))
+            if (direct) {
+                separatorLabel(message, previous)?.let { stamp ->
+                    Text(stamp, fontFamily = Dvd.Body, fontWeight = FontWeight.SemiBold, fontSize = 11.sp, color = Dvd.Quiet,
+                        textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 4.dp))
+                }
+            }
+            ChatRow(
+                message = message,
+                mine = mine,
+                startsGroup = previous?.authorId != message.authorId || (direct && farApart(previous, message)),
+                endsGroup = endsGroup,
+                showsAuthors = showsAuthors,
+                animateIn = fresh,
+                onAuthor = onAuthor,
+                onReport = onReport,
+                onDelete = onDelete,
+                modifier = Modifier.animateItem(),
+                showTime = !direct,
+                leading = if (direct && !mine) ({
+                    // Their face beside the last bubble of their run, a gap elsewhere.
+                    Box(Modifier.size(28.dp)) {
+                        if (endsGroup) {
+                            DvdAvatar(
+                                url = peer?.avatarUrl.orEmpty(),
+                                avatarKey = peer?.avatarKey ?: "mono-ink",
+                                initial = initialsOf(peer?.displayName ?: message.authorName),
+                                size = 28.dp,
+                                modifier = Modifier.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onPeer),
+                            )
+                        }
+                    }
+                }) else null,
+            )
+            LaunchedEffect(message.id) { seen += message.id }
+        }
+        item { Spacer(Modifier.height(8.dp)) }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ChatRow(
+    message: ChatMessage,
+    mine: Boolean,
+    startsGroup: Boolean,
+    endsGroup: Boolean,
+    showsAuthors: Boolean,
+    animateIn: Boolean,
+    onAuthor: ((String) -> Unit)?,
+    onReport: ((ChatMessage) -> Unit)?,
+    onDelete: ((ChatMessage) -> Unit)?,
+    modifier: Modifier = Modifier,
+    showTime: Boolean = true,
+    leading: (@Composable () -> Unit)? = null,
+) {
+    val appear = remember { Animatable(if (animateIn) 0f else 1f) }
+    LaunchedEffect(Unit) { if (appear.value < 1f) appear.animateTo(1f, iosSpring(0.42f, 0.78f)) }
+    var menu by remember { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
+    val haptics = LocalHapticFeedback.current
+    val shape = remember(mine, startsGroup, endsGroup) { BubbleShape(mine, !startsGroup, !endsGroup) }
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = if (leading != null) 10.dp else 14.dp)
+            .padding(top = if (startsGroup) 10.dp else 2.dp)
+            .graphicsLayer {
+                val p = appear.value
+                val s = 0.86f + 0.14f * p
+                scaleX = s
+                scaleY = s
+                alpha = p.coerceIn(0f, 1f)
+                translationY = 12.dp.toPx() * (1f - p)
+                transformOrigin = androidx.compose.ui.graphics.TransformOrigin(if (mine) 1f else 0f, 1f)
+            },
+        horizontalAlignment = if (mine) Alignment.End else Alignment.Start,
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        if (showsAuthors && !mine && startsGroup) {
+            Row(
+                Modifier
+                    .padding(start = 4.dp)
+                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onAuthor?.invoke(message.authorId) },
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                // The app's squircle face, as everywhere else (OM, 2026-10-09).
+                DvdAvatar(
+                    url = message.authorAvatarUrl,
+                    avatarKey = message.authorAvatarKey,
+                    initial = initialsOf(message.authorName),
+                    size = 18.dp,
+                )
+                Text(
+                    if (message.authorUsername.isEmpty()) message.authorName else "${message.authorName} · @${message.authorUsername}",
+                    fontFamily = Dvd.Body,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 10.5.sp,
+                    color = Dvd.Quiet,
+                )
+            }
+        }
+        Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        leading?.invoke()
+        Box {
+            Text(
+                text = message.body,
+                fontFamily = Dvd.Body,
+                fontSize = 14.5.sp,
+                color = if (mine) Dvd.OnInk else Dvd.Ink,
+                modifier = Modifier
+                    .widthIn(max = 290.dp)
+                    .clip(shape)
+                    .background(if (mine) Dvd.Ink else Dvd.Card)
+                    .then(if (mine) Modifier else Modifier.border(1.dp, Dvd.Rule, shape))
+                    .combinedClickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = {},
+                        onLongClick = {
+                            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                            menu = true
+                        },
+                    )
+                    .padding(horizontal = 14.dp, vertical = 9.dp),
+            )
+            DropdownMenu(
+                expanded = menu,
+                onDismissRequest = { menu = false },
+                shape = dvdRounded(13.dp),
+                containerColor = Dvd.Card,
+            ) {
+                DropdownMenuItem(
+                    text = { Text("Copy", fontFamily = Dvd.Body, fontSize = 15.sp, color = Dvd.Ink) },
+                    onClick = {
+                        clipboard.setText(AnnotatedString(message.body))
+                        menu = false
+                    },
+                )
+                if (mine && onDelete != null) {
+                    DropdownMenuItem(
+                        text = { Text("Delete", fontFamily = Dvd.Body, fontSize = 15.sp, color = Dvd.Blood) },
+                        onClick = { menu = false; onDelete(message) },
+                    )
+                }
+                if (!mine && onReport != null) {
+                    DropdownMenuItem(
+                        text = { Text("Report", fontFamily = Dvd.Body, fontSize = 15.sp, color = Color(0xFFFF3B30)) },
+                        onClick = {
+                            menu = false
+                            onReport(message)
+                        },
+                    )
+                }
+            }
+        }
+        }
+        if (endsGroup && showTime) {
+            shortTime(message.createdAt)?.let {
+                Text(it, fontFamily = Dvd.Body, fontSize = 9.5.sp, color = Dvd.Quiet, modifier = Modifier.padding(horizontal = 6.dp))
+            }
+        }
+    }
+}
+
+private fun shortTime(raw: String): String? = runCatching {
+    DateFormat.getTimeInstance(DateFormat.SHORT).format(Date.from(Instant.parse(raw)))
+}.getOrNull()
+
+/** `DvdBubbleShape`: rounder outside a run, tight where one author's bubbles meet. */
+private class BubbleShape(private val mine: Boolean, private val tightTop: Boolean, private val tightBottom: Boolean) : Shape {
+    override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline {
+        val big = minOf(19 * density.density, size.height / 2f)
+        val small = 6 * density.density
+        val topLeading = if (!mine && tightTop) small else big
+        val bottomLeading = if (!mine && tightBottom) small else if (!mine) small else big
+        val topTrailing = if (mine && tightTop) small else big
+        val bottomTrailing = if (mine && tightBottom) small else if (mine) small else big
+        return Outline.Rounded(
+            RoundRect(
+                0f, 0f, size.width, size.height,
+                topLeftCornerRadius = CornerRadius(topLeading),
+                topRightCornerRadius = CornerRadius(topTrailing),
+                bottomRightCornerRadius = CornerRadius(bottomTrailing),
+                bottomLeftCornerRadius = CornerRadius(bottomLeading),
+            ),
+        )
+    }
+}
+
+/**
+ * `DvdChatComposer`: a growing one-to-five-line field in Liquid Glass, and a
+ * glass ink send button that swells out of it when there is something to
+ * send. On send its arrow launches upward. A counter appears near the limit.
+ */
+@Composable
+fun IosChatComposer(
+    text: String,
+    onText: (String) -> Unit,
+    placeholder: String,
+    limit: Int,
+    sending: Boolean,
+    bottomInset: Dp,
+    backdrop: com.kyant.backdrop.Backdrop,
+    onSend: () -> Unit,
+) {
+    val trimmed = text.trim()
+    val canSend = trimmed.isNotEmpty() && !sending && text.length <= limit
+    val haptics = LocalHapticFeedback.current
+    val scope = rememberCoroutineScope()
+    val launch = remember { Animatable(0f) }
+    fun send() {
+        if (!canSend) return
+        haptics.performHapticFeedback(HapticFeedbackType.Confirm)
+        scope.launch {
+            launch.animateTo(1f, tween(220, easing = FastOutLinearInEasing))
+            delay(60)
+            launch.snapTo(0f)
+        }
+        onSend()
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .liquidGlass(
+                backdrop = backdrop,
+                shape = dvdRounded(0.dp),
+                tint = Dvd.Paper.copy(alpha = 0.35f),
+                blur = 18.dp,
+                refraction = 0.dp,
+                depth = 0.dp,
+                shadow = null,
+                fallback = Dvd.Paper,
+            )
+            .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 10.dp + bottomInset),
+        horizontalAlignment = Alignment.End,
+    ) {
+        Box(Modifier.fillMaxWidth().height(1.dp).offset(y = (-8).dp).background(Dvd.Rule))
+        AnimatedVisibility(text.length > limit - 40, enter = fadeIn(), exit = fadeOut()) {
+            Text(
+                "${maxOf(0, limit - text.length)}",
+                fontFamily = Dvd.Body,
+                fontWeight = FontWeight.Bold,
+                fontSize = 10.5.sp,
+                color = if (text.length > limit) Dvd.Badge else Dvd.Quiet,
+                modifier = Modifier.padding(end = 64.dp, bottom = 4.dp),
+            )
+        }
+        Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            val style = TextStyle(fontFamily = Dvd.Body, fontSize = 15.sp, color = Dvd.Ink)
+            BasicTextField(
+                value = text,
+                onValueChange = onText,
+                textStyle = style,
+                maxLines = 5,
+                cursorBrush = SolidColor(Dvd.Link),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { send() }),
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = 46.dp)
+                    .liquidGlass(
+                        backdrop = backdrop,
+                        shape = dvdRounded(22.dp),
+                        tint = Dvd.Card.copy(alpha = 0.55f),
+                        blur = 6.dp,
+                        refraction = 10.dp,
+                        depth = 16.dp,
+                        shadow = null,
+                        fallback = Dvd.Card,
+                    )
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                decorationBox = { inner ->
+                    Box(contentAlignment = Alignment.CenterStart) {
+                        if (text.isEmpty()) Text(placeholder, style = style.copy(color = Dvd.Quiet.copy(alpha = 0.8f)), maxLines = 1)
+                        inner()
+                    }
+                },
+            )
+            AnimatedVisibility(
+                visible = canSend || sending,
+                enter = scaleIn(iosSpring(0.38f, 0.62f), initialScale = 0.3f, transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0.5f)) + fadeIn(iosSpring(0.38f, 0.62f)),
+                exit = scaleOut(iosSpring(0.38f, 0.62f), targetScale = 0.3f, transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0.5f)) + fadeOut(iosSpring(0.38f, 0.62f)),
+            ) {
+                val interaction = remember { MutableInteractionSource() }
+                val pressed by interaction.collectIsPressedAsState()
+                Box(
+                    modifier = Modifier
+                        .size(46.dp)
+                        .graphicsLayer { val s = if (pressed) 0.975f else 1f; scaleX = s; scaleY = s }
+                        .liquidGlass(
+                            backdrop = backdrop,
+                            shape = CircleShape,
+                            tint = Dvd.Ink.copy(alpha = 0.92f),
+                            blur = 4.dp,
+                            refraction = 8.dp,
+                            depth = 12.dp,
+                            shadow = null,
+                            fallback = Dvd.Ink,
+                        )
+                        .clickable(interactionSource = interaction, indication = null, enabled = canSend) { send() },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (sending) {
+                        IosSpinner(size = 17.dp, colour = Dvd.OnInk)
+                    } else {
+                        IosIcon(
+                            IosGlyph.ARROW_UP,
+                            Dvd.OnInk,
+                            size = 20.dp,
+                            weight = 2.6f,
+                            modifier = Modifier.graphicsLayer {
+                                val p = launch.value
+                                translationY = -30.dp.toPx() * p
+                                alpha = 1f - p
+                                val s = 1f - 0.4f * p
+                                scaleX = s
+                                scaleY = s
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* ----------------------------------------------------------- action sheet */
+
+class IosSheetAction(val title: String, val destructive: Boolean = false, val onClick: () -> Unit)
+
+/** SwiftUI `confirmationDialog`: a titled group of actions and a separate Cancel. */
+@Composable
+fun IosActionSheet(title: String, actions: List<IosSheetAction>, insetBottom: Dp, onDismiss: () -> Unit) {
+    val appear = remember { Animatable(0f) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) { appear.animateTo(1f, iosSpring(0.4f, 0.9f)) }
+    fun close(then: () -> Unit = {}) {
+        scope.launch {
+            appear.animateTo(0f, iosSpring(0.3f, 1f))
+            onDismiss()
+            then()
+        }
+    }
+    Box(
+        Modifier
+            .fillMaxSize()
+            .graphicsLayer { alpha = 1f }
+            .background(Color.Black.copy(alpha = 0.22f * appear.value))
+            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { close() },
+    ) {
+        Column(
+            Modifier
+                .align(Alignment.BottomCenter)
+                .padding(horizontal = 8.dp)
+                .padding(bottom = insetBottom + 8.dp)
+                .graphicsLayer { translationY = size.height * (1f - appear.value) },
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Column(Modifier.fillMaxWidth().clip(dvdRounded(14.dp)).background(Dvd.Card)) {
+                Text(
+                    title,
+                    fontFamily = Dvd.Body,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 13.sp,
+                    color = Dvd.Quiet,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
+                )
+                actions.forEach { action ->
+                    Box(Modifier.fillMaxWidth().height(1.dp).background(Dvd.RowRule))
+                    Text(
+                        action.title,
+                        fontFamily = Dvd.Body,
+                        fontSize = 17.sp,
+                        color = if (action.destructive) Color(0xFFFF3B30) else Dvd.Link,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { close(action.onClick) }
+                            .padding(vertical = 17.dp),
+                    )
+                }
+            }
+            Text(
+                "Cancel",
+                fontFamily = Dvd.Body,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 17.sp,
+                color = Dvd.Link,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(dvdRounded(14.dp))
+                    .background(Dvd.Card)
+                    .clickable { close() }
+                    .padding(vertical = 17.dp),
+            )
+        }
+    }
+}
+
+/* ------------------------------------------------------------ connections */
+
+@Composable
+fun IosConnectionsScreen(
+    followers: List<ApiPlayer>,
+    following: List<ApiPlayer>,
+    initialPage: Int,
+    insetTop: Dp,
+    insetBottom: Dp,
+    onBack: () -> Unit,
+    onOpenPlayer: (String) -> Unit,
+    activityOf: (String) -> FriendActivity? = { null },
+    onJoin: ((String) -> Unit)? = null,
+) {
+    val pager = rememberPagerState(initialPage = initialPage) { 2 }
+    val scope = rememberCoroutineScope()
+    IosPageChrome("Connections", insetTop, onBack) {
+        // The same Liquid Glass pill as every other switcher, riding the pager.
+        LiquidSegmented(
+            options = listOf("Followers", "Following"),
+            counts = listOf("${followers.size}", "${following.size}"),
+            selected = pager.currentPage,
+            follow = pager.currentPage + pager.currentPageOffsetFraction,
+            height = 38.dp,
+            fontSize = 12.5.sp,
+            onSelect = { index -> scope.launch { pager.animateScrollToPage(index, animationSpec = iosSpring(0.34f, 0.8f)) } },
+            modifier = Modifier.padding(16.dp).fillMaxWidth(),
+        )
+        HorizontalPager(state = pager, modifier = Modifier.weight(1f)) { page ->
+            val rows = if (page == 0) followers else following
+            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                IosPaperCard {
+                    if (rows.isEmpty()) {
+                        IosEmptyPanel(if (page == 0) "No followers yet" else "Not following anyone yet", "Connections update from your david.io account.")
+                    }
+                    rows.forEach { person ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 58.dp)
+                                .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onOpenPlayer(person.id) }
+                                .padding(horizontal = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            val activity = activityOf(person.id)
+                            DvdAvatar(person.avatarUrl, person.avatarKey, initialsOf(person.displayName), 36.dp,
+                                online = activity?.online == true)
+                            PersonText(person.displayName, person.handle, Modifier.weight(1f), activity, onJoin)
+                            IosIcon(IosGlyph.CHEVRON_RIGHT, Dvd.Chevron, size = 12.dp, weight = 2.6f)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(24.dp + insetBottom))
+            }
+        }
+    }
+}
+
+/* --------------------------------------------------------------- profile */
+
+// The profile page is IosProfile.kt (OM, 2026-09-29).
+
+@Composable
+fun IosEditProfileScreen(
+    displayName: String,
+    ingameName: String,
+    username: String,
+    bio: String,
+    avatarUrl: String,
+    avatarKey: String,
+    renames: String,
+    busy: Boolean,
+    error: String,
+    insetTop: Dp,
+    insetBottom: Dp,
+    onBack: () -> Unit,
+    onSave: (displayName: String, ingameName: String, username: String, bio: String) -> Unit,
+    onPickPhoto: () -> Unit,
+    onRemovePhoto: () -> Unit,
+    onDeleteAccount: () -> Unit,
+) {
+    var name by remember { mutableStateOf(displayName) }
+    var arena by remember { mutableStateOf(ingameName) }
+    var user by remember { mutableStateOf(username) }
+    var about by remember { mutableStateOf(bio) }
+    var confirmDelete by remember { mutableStateOf(false) }
+    Box(Modifier.fillMaxSize()) {
+        IosPageChrome("Edit profile", insetTop, onBack, actionTitle = "Save", onAction = { onSave(name, arena, user, about) }) {
+            Column(
+                Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).imePadding().padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(13.dp),
+            ) {
+                Column(
+                    Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    DvdAvatar(avatarUrl, avatarKey, initialsOf(name), 76.dp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {
+                        Text(
+                            if (avatarUrl.isNotEmpty()) "Change photo" else "Add photo",
+                            fontFamily = Dvd.Body, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Dvd.Link,
+                            modifier = Modifier.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onPickPhoto),
+                        )
+                        if (avatarUrl.isNotEmpty()) {
+                            Text(
+                                "Remove",
+                                fontFamily = Dvd.Body, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Dvd.Badge,
+                                modifier = Modifier.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onRemovePhoto),
+                            )
+                        }
+                    }
+                    if (busy) IosSpinner(size = 20.dp)
+                }
+                EditField("Display name", name) { name = it }
+                EditField("Arena name", arena) { arena = it }
+                EditField("Username", user) { user = it }
+                EditField("Bio", about) { about = it }
+                if (renames.isNotEmpty()) {
+                    Text(renames, fontFamily = Dvd.Body, fontSize = 11.5.sp, color = Dvd.Quiet, modifier = Modifier.fillMaxWidth())
+                }
+                if (error.isNotEmpty()) Text(error, fontFamily = Dvd.Body, fontSize = 12.sp, color = Color(0xFFFF3B30))
+                val shape = dvdRounded(13.dp)
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .clip(shape)
+                        .border(1.dp, Color(0xFFFF3B30).copy(alpha = 0.3f), shape)
+                        .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { confirmDelete = true },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("Delete account", fontFamily = Dvd.Body, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Color(0xFFFF3B30))
+                }
+                Spacer(Modifier.height(insetBottom))
+            }
+        }
+        if (confirmDelete) {
+            IosActionSheet(
+                title = "Delete your david.io account? This cannot be undone.",
+                actions = listOf(IosSheetAction("Delete account", destructive = true, onClick = onDeleteAccount)),
+                insetBottom = insetBottom,
+                onDismiss = { confirmDelete = false },
+            )
+        }
+    }
+}
+
+@Composable
+private fun EditField(label: String, value: String, onValue: (String) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+        Text(label.uppercase(), fontFamily = Dvd.Body, fontWeight = FontWeight.Bold, fontSize = 9.5.sp, letterSpacing = 1.sp, color = Dvd.Quiet)
+        val style = TextStyle(fontFamily = Dvd.Body, fontSize = 15.sp, color = Dvd.Ink)
+        BasicTextField(
+            value = value,
+            onValueChange = onValue,
+            singleLine = true,
+            textStyle = style,
+            cursorBrush = SolidColor(Dvd.Link),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp)
+                .clip(dvdRounded(13.dp))
+                .background(Dvd.Card)
+                .border(1.dp, Dvd.Rule, dvdRounded(13.dp))
+                .padding(horizontal = 14.dp),
+            decorationBox = { inner ->
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                    if (value.isEmpty()) Text(label, style = style.copy(color = Dvd.Quiet.copy(alpha = 0.7f)))
+                    inner()
+                }
+            },
+        )
+    }
+}
+
+@Suppress("unused")
+private val keepBuild = Build.VERSION.SDK_INT
+
+
+/* ------------------------------------------------------------ voice rooms */
+
+/**
+ * Voice rooms, redesigned (OM, 2026-09-30): one card per room like a modern
+ * audio app. A verify card until the voice profile is verified; official
+ * Dvd rooms first (the real Dvd mark, open to everyone); the player's own
+ * room; rooms that are live now; then quiet ones. Each card says who made it,
+ * whether a code is needed, and how many are in. Dvd iOS: `DvdVoiceKit.swift`.
+ */
+@Composable
+fun IosVoiceDirectory(
+    verified: Boolean,
+    rooms: List<io.david.mobile.data.VoiceRoom>,
+    refreshing: Boolean,
+    insetTop: Dp,
+    insetBottom: Dp,
+    onBack: () -> Unit,
+    onNew: () -> Unit,
+    onVerify: () -> Unit,
+    onRefresh: () -> Unit,
+    onOpenRoom: (io.david.mobile.data.VoiceRoom) -> Unit,
+) {
+    val official = rooms.filter { it.managedPublic }
+    val mine = rooms.filter { it.mine && !it.managedPublic }
+    val live = rooms.filter { !it.managedPublic && !it.mine && it.active }
+    val quiet = rooms.filter { !it.managedPublic && !it.mine && !it.active }
+    val talking = rooms.filter { it.active }.sumOf { it.activeCount }
+    IosPageChrome("Voice rooms", insetTop, onBack, actionTitle = "New", onAction = onNew) {
+        IosRefreshable(refreshing, onRefresh, Modifier.weight(1f)) {
+            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                // Who is talking right now, in one line.
+                Row(
+                    Modifier.padding(start = 22.dp, end = 22.dp, top = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    VoiceLiveBars(if (talking > 0) Dvd.Live else Dvd.Quiet, playing = talking > 0, height = 13.dp)
+                    Text(
+                        if (talking > 0) "$talking ${if (talking == 1) "person" else "people"} talking now" else "No one is talking yet",
+                        fontFamily = Dvd.Body, fontWeight = FontWeight.SemiBold, fontSize = 13.sp,
+                        color = if (talking > 0) Dvd.Live else Dvd.Quiet,
+                    )
+                }
+                if (!verified) {
+                    Row(
+                        Modifier
+                            .padding(start = 16.dp, end = 16.dp, top = 14.dp)
+                            .fillMaxWidth()
+                            .clip(dvdRounded(20.dp))
+                            .background(Dvd.Ink)
+                            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onVerify)
+                            .padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(13.dp),
+                    ) {
+                        IosIcon(IosGlyph.CHECKMARK_SHIELD, Dvd.OnInk, size = 26.dp)
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Text("Verify once, talk anywhere", fontFamily = Dvd.Body, fontWeight = FontWeight.Bold, fontSize = 14.5.sp, color = Dvd.OnInk)
+                            Text("One email code unlocks player rooms. Official rooms are open now.", fontFamily = Dvd.Body,
+                                fontSize = 11.5.sp, color = Dvd.OnInk.copy(alpha = 0.72f))
+                        }
+                        Box(Modifier.clip(CircleShape).background(Dvd.OnInk).padding(horizontal = 13.dp, vertical = 7.dp)) {
+                            Text("Verify", fontFamily = Dvd.Body, fontWeight = FontWeight.Bold, fontSize = 12.5.sp, color = Dvd.Ink)
+                        }
+                    }
+                }
+                VoiceSectionTitle("Official david.io rooms", "Open to everyone")
+                if (official.isEmpty()) IosPaperCard { IosEmptyPanel("Official rooms are quiet", "david.io-managed public rooms appear here first.") }
+                official.forEach { room -> VoiceRoomCard(room) { onOpenRoom(room) } }
+                if (mine.isNotEmpty()) {
+                    VoiceSectionTitle("Your room")
+                    mine.forEach { room -> VoiceRoomCard(room) { onOpenRoom(room) } }
+                }
+                VoiceSectionTitle("Live now", if (live.isEmpty()) "" else "${live.size}")
+                if (live.isEmpty()) {
+                    Text(
+                        if (quiet.isEmpty()) "No player rooms yet. Tap New to start one." else "No player room is live. Start one, or wake a quiet one.",
+                        fontFamily = Dvd.Body, fontSize = 12.5.sp, color = Dvd.Quiet,
+                        modifier = Modifier.padding(horizontal = 22.dp, vertical = 4.dp),
+                    )
+                }
+                live.forEach { room -> VoiceRoomCard(room) { onOpenRoom(room) } }
+                if (quiet.isNotEmpty()) {
+                    VoiceSectionTitle("Quiet rooms", "${quiet.size}")
+                    quiet.forEach { room -> VoiceRoomCard(room) { onOpenRoom(room) } }
+                }
+                Spacer(Modifier.height(24.dp + insetBottom))
+            }
+        }
+    }
+}

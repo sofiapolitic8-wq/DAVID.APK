@@ -1,0 +1,40 @@
+MODIFICATIONS (GNU GPL v3, section 5a)
+======================================
+Base: Wyrm for Android 8.0.0 by OM Rajput (see LICENSE, NOTICE).
+This is a modified version, changed on 2026-10-17 by david.io.
+
+Changes
+-------
+1. Identity: display name "david.io", applicationId / package io.david.mobile, identifiers
+   renamed, launcher icon and in-app mark replaced with an original "d" mark, engine
+   wordmark changed to DAVID.IO.
+2. No upstream services: Firebase / Google Services plugin, FCM code, the upstream Google
+   client id, the upstream API host, release-notes repo, update manifests, publish script,
+   updater trust key (placeholder resource is used) and the contact / payment details in
+   About were removed. Backend calls are switched off (DVD_BACKEND_DISCONNECTED = true).
+3. Simple UI: the app always starts on Home (Play / arena picker) with no login; the tab bar
+   is Play, Skin, Settings; account, notifications, update and help rows are gone from
+   Settings; trails are off (TRAILS_ENABLED = false); voice stays off; What's New never
+   opens on its own.
+4. Manifest: microphone, camera, media, install-packages and storage permissions, the voice
+   service, the push service and the trails file provider were removed.
+5. Team mode (data/TeamService.kt): Team IDs starting DVD- or LWK- use the user's own team
+   server (server/server.js) instead of ntl-slither.com; createOwnTeam(); the nickname
+   prefix is exactly 8 characters (DVDPLYER) as the team service requires.
+6. Team UI (ui/TeamScreen.kt, ui/DvdOverlay.kt): "Create your own team" block; a pasted
+   invite "ID key [server]" is split over the fields and sets the server address.
+7. About screen shows only the two required credit lines.
+8. PRIVACY.md and README.md written for this app; GitHub Actions workflow and
+   tools/install-textures.py added.
+9. server/: the david.io team server (Node 16+, no dependencies).
+
+Not done yet: see HANDOFF.txt.
+
+6. Textures (2026-10-17): added app/res/textures (generated, see HANDOFF.txt), tools/make-textures.py,
+   tools/ext-art, eight extension arena floors wired into the background picker (18 entries),
+   tools/generate-focus-backgrounds.py and tools/dvd-tag-append.py no longer need the iOS tree.
+
+7. Second pass (2026-10-17): all nine david.io extension jpgs shipped byte-identical (bg54.jpg is floor 0,
+   background_4k.png removed); restored the shader sources bd.slang and bg.slang; NTL tag network off by
+   default (DVD_NTL_TAG_NETWORK); new-install food = small plain white, Food size minimum 0.1;
+   .gitignore added.

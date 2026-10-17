@@ -1,0 +1,1214 @@
+package io.david.mobile;
+
+import android.Manifest;
+import android.app.Activity;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
+import android.view.PixelCopy;
+import android.view.SurfaceView;
+import android.view.View;
+import android.view.WindowManager;
+
+import io.david.mobile.ui.DvdOverlay;
+
+import org.libsdl.app.SDLActivity;
+
+import java.io.InputStream;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/** Android entry point and the lifecycle-safe bridge for the native Update Center. */
+public final class DvdActivity extends SDLActivity {
+    private static final String TAG = "Dvd";
+
+    static final int UPDATE_IDLE = 0;
+    static final int UPDATE_CHECKING = 1;
+    static final int UPDATE_UP_TO_DATE = 2;
+    static final int UPDATE_AVAILABLE = 3;
+    static final int UPDATE_DOWNLOADING = 4;
+    static final int UPDATE_VERIFYING = 5;
+    static final int UPDATE_READY_TO_INSTALL = 6;
+    static final int UPDATE_INSTALLING = 7;
+    static final int UPDATE_ERROR = 8;
+
+    static final int BACKUP_IDLE = 0;
+    static final int BACKUP_SELECTING_FOLDER = 1;
+    static final int BACKUP_SAVING = 2;
+    static final int BACKUP_SAVED = 3;
+    static final int BACKUP_SCANNING = 4;
+    static final int BACKUP_FOUND = 5;
+    static final int BACKUP_NONE = 6;
+    static final int BACKUP_RESTORING = 7;
+    static final int BACKUP_RESTORED = 8;
+    static final int BACKUP_ERROR = 9;
+    static final int BACKUP_RESTORE_AVAILABLE = 10;
+    static final int BACKUP_CURRENT = 11;
+    static final int BACKUP_RESTARTING = 12;
+    static final int BACKUP_PARTIAL = 13;
+
+    private static final int REQUEST_LEGACY_STORAGE = 6418;
+    private static final int REQUEST_PROFILE_PHOTO = 7311;
+    private static final int REQUEST_POST_NOTIFICATIONS = 8123;
+    private static final int REQUEST_RECORD_AUDIO = 8124;
+
+    /** Longest edge kept when reading a chosen photo, before cropping. */
+    private static final int MAX_PHOTO_PIXELS = 1600;
+
+    /** Mirrors the screen enum in app/src/constants.h. */
+    static final int SCREEN_TITLE = 0;
+    static final int SCREEN_SKIN_EDITOR = 1;
+    static final int SCREEN_PLAYING = 2;
+    static final int SCREEN_LOBBY = 3;
+
+    private final ExecutorService photoExecutor = Executors.newSingleThreadExecutor();
+    private UpdateManager updateManager;
+    private DvdGameMode gameMode;
+    private DvdOverlay overlay;
+    private boolean titleScreenReady;
+
+    private static native void nativeOnUpdateState(
+            int status, int progress, String title, String detail,
+            long versionCode, String versionName);
+    private static native void nativeOnBackupState(
+            int status, int count, String title, String detail);
+    private static native String nativeApplyBackup(byte[] payload, byte[] teamConfig);
+    /**
+     * Compose Home -> engine. Both are parked in a native mailbox and applied on
+     * the engine thread, so calling them from the main thread is safe.
+     */
+    private static native void nativeEnterArena(
+            String nickname, String address, long attemptId);
+    private static native void nativeEnterAiMode(String nickname);
+    private static native void nativeEnterAiLayoutEditor(String nickname);
+    private static native void nativeExitAiLayoutEditor();
+    private static native void nativeToggleEditorLeaderboard();
+    private static native void nativeSetEditorBare(boolean bare);
+    /** Snake-look preview: the bare editor shows assist or normal (OM, 2026-10-05). */
+    private static native void nativeSetEditorAssist(boolean on);
+    /** Settings › Modes › Assist: the assist laser in joystick mode (length: share of the short side). */
+    private static native void nativeSetJoystickLaser(boolean on, float length);
+    private static native void nativeSetNearOriginal(boolean on, int server);
+    /** Settings › Performance: present mode (vsync) and frame cap (0 = none). */
+    private static native void nativeSetFramePolicy(boolean vsync, int cap);
+    /* Background play (2026-10-13): main.c. */
+    private static native void nativeSetBackgroundPlay(boolean on);
+    /** The engine's screen, as last reported (setScreenFromNative). */
+    private static volatile int engineScreen = -1;
+    /** The activity is out of sight (onStop until onStart). */
+    private boolean backgrounded;
+    private static native void nativeSetPerformanceChip(String text);
+    private static native void nativeSetNickname(String nickname);
+    private static native void nativeSelectArena(String address);
+    private static native void nativeSetArenaTheme(int[] colours, boolean dark);
+    private static native void nativeOpenScreen(int screen);
+    private static native void nativeSkinSetPreset(int preset);
+    private static native void nativeSkinSetMode(boolean custom);
+    private static native void nativeSkinSetCode(String code);
+    private static native void nativeSkinSetColors(int[] colors);
+    private static native void nativeSkinSync(boolean save);
+    /** Skin Studio (OM, 2026-10-12): the atlas PNG and its text; empty takes it off. */
+    private static native void nativeStudioSet(String path, String text);
+    private static native void nativeSkinSetBackground(int index);
+    private static native void nativeArenaSkinSet(int snakeId, String nickname, int[] colors);
+    private static native void nativeArenaSkinsClear();
+
+    /** Hands one fetched arena skin to the engine. */
+    public static void applyArenaSkin(int snakeId, String nickname, int[] colors) {
+        nativeArenaSkinSet(snakeId, nickname == null ? "" : nickname,
+                           colors == null ? new int[0] : colors);
+    }
+
+    public static void clearArenaSkins() { nativeArenaSkinsClear(); }
+    private static native void nativeSkinSetAccessory(int accessory);
+    private static native void nativeSkinCommit();
+    private static native void nativeSkinSetLayout(
+            float previewCentreY, float previewScale,
+            float accessoryX, float accessoryY,
+            float accessoryCell, float accessoryGap);
+    private static native void nativeSkinSetPostcard(boolean on);
+    private static native void nativeDeathPlay();
+    private static native void nativeDeathHome();
+
+    /**
+     * The settings bridge.
+     *
+     * The engine describes every setting it holds — id, type, range, options —
+     * and Compose renders itself from that description, so a new setting is a
+     * line of C and nothing here.
+     */
+    private static native String nativeSettingsSnapshot();
+    private static native String nativeHotkeysSnapshot();
+    private static native String nativeKeyOptions();
+    private static native String nativeSettingsVersion();
+    private static native void nativeSetAutoRespawn(boolean on);
+    private static native void nativeSetSetting(
+            String id, float a, float b, float c, float d, int count);
+    private static native void nativeSetHotkey(
+            int action, int key, int mode, boolean visible, float x, float y);
+    private static native void nativeSettingsAction(int action);
+    private static native String nativeTeamPresence();
+    private static native void nativeSetTeamMembers(String packed);
+    private static native void nativeSetTeamChat(String packed);
+    private static native void nativeSetPlayFeel(boolean originalArrow, boolean lookAhead, int zoomStyle);
+    /* Controls › Joystick knob (2026-10-13): true = back to the centre. */
+    private static native void nativeSetJoystickKnob(boolean centre);
+    private static native void nativeSetTeamHudStyle(float[] values);
+    private static native void nativeCloseTeamChat(float seconds);
+    private static native String nativeUpdateSnapshot();
+    private static native void nativeUpdateAction(int action);
+    private static native void nativeSetArrowSkin(int skin, float brightness);
+    private static native void nativeSetDvdLook(int hair, int hairRgb, int ears, int glasses);
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        // First: read how the last run ended, then arm the crash watch.
+        // Preference files older builds kept under another prefix (7.1.2).
+        io.david.mobile.data.LegacyPrefs.migrate(this);
+        io.david.mobile.data.CrashWatch.install(this);
+        // Arena drop reports: preferences only; the network watch runs while resumed.
+        io.david.mobile.data.DropWatch.install(this);
+        super.onCreate(savedInstanceState);
+        // Image arrows: the saved choice reaches the engine before the first frame.
+        io.david.mobile.ui.ArrowSkinStore.attach(this, (skin, brightness) -> {
+            try { nativeSetArrowSkin(skin, brightness); } catch (UnsatisfiedLinkError ignored) { }
+            return kotlin.Unit.INSTANCE;
+        });
+        // Play orientation (portrait play): read before any screen asks to turn.
+        io.david.mobile.data.PlayOrientation.INSTANCE.load(this);
+        // Settings › Performance: the engine's frame policy and the display rate.
+        // Phase 3 H: set before attach, which publishes at once.
+        io.david.mobile.data.DvdPerformance.INSTANCE.setChipSink(text -> {
+            try { nativeSetPerformanceChip(text); } catch (UnsatisfiedLinkError ignored) { }
+            return kotlin.Unit.INSTANCE;
+        });
+        io.david.mobile.data.DvdPerformance.INSTANCE.attach(this, this::applyFramePolicy);
+        // The arena's team roster and chat window: their saved look reaches the engine first.
+        io.david.mobile.ui.TeamHudStore.attach(this, values -> {
+            try { nativeSetTeamHudStyle(values); } catch (UnsatisfiedLinkError ignored) { }
+            return kotlin.Unit.INSTANCE;
+        });
+        // Settings › Controls play feel: slither's arrow motion, look ahead, spring zoom.
+        io.david.mobile.ui.PlayFeelStore.attach(this, (originalArrow, lookAhead, zoomStyle) -> {
+            try { nativeSetPlayFeel(originalArrow, lookAhead, zoomStyle); } catch (UnsatisfiedLinkError ignored) { }
+            return kotlin.Unit.INSTANCE;
+        });
+        io.david.mobile.ui.PlayFeelStore.attachKnob(centre -> {
+            try { nativeSetJoystickKnob(centre); } catch (UnsatisfiedLinkError ignored) { }
+            return kotlin.Unit.INSTANCE;
+        });
+        // The assist laser in joystick mode: the saved choice reaches the engine first.
+        io.david.mobile.ui.JoystickLaserStore.attach(this, (on, length) -> {
+            try { nativeSetJoystickLaser(on, length); } catch (UnsatisfiedLinkError ignored) { }
+            return kotlin.Unit.INSTANCE;
+        });
+        // Home › Near Original: slither's own HUD and controls (and the arena's number).
+        io.david.mobile.ui.NearOriginalStore.attach(this, (on, server) -> {
+            try { nativeSetNearOriginal(on, server); } catch (UnsatisfiedLinkError ignored) { }
+            return kotlin.Unit.INSTANCE;
+        });
+        // Dvd looks (hair, ears, glasses): drawn on this phone only, never sent.
+        io.david.mobile.ui.DvdLookStore.attach(this, (hair, hairRgb, ears, glasses) -> {
+            try { nativeSetDvdLook(hair, hairRgb, ears, glasses); } catch (UnsatisfiedLinkError ignored) { }
+            return kotlin.Unit.INSTANCE;
+        });
+
+        /*
+         * Nobody moves the screen for the keyboard except us.
+         *
+         * A fullscreen window cannot be resized for the keyboard, so Android
+         * falls back to sliding the whole window up until the focused field
+         * clears the keys. Compose was then padding for the keyboard as well,
+         * on top of a window that had already been pushed — so a composer ended
+         * up floating high above the keys, and in the arena the chat panel was
+         * shoved off the top of the screen entirely. Two hands on the same
+         * wheel. This takes one of them off; the layout keeps its own padding,
+         * which is the one that knows where the composer actually is.
+         */
+        getWindow().setSoftInputMode(
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+                        | WindowManager.LayoutParams.SOFT_INPUT_STATE_UNSPECIFIED);
+
+        // Manual .dvd backups are gone (2026-10-01): settings live in the
+        // account now (data/AccountSync.kt), saved on log out and in the background.
+        updateManager = new UpdateManager(this);
+        gameMode = new DvdGameMode(this);
+        ensureNotificationsReady();
+
+        // Dvd's interface layer sits above SDL's surface and owns Home
+        // outright. It stays hidden until the engine reports which screen it is
+        // on, so it can never cover the launch or steal its touches.
+        overlay = new DvdOverlay(this);
+        overlay.attach();
+        overlay.setHost(new DvdOverlay.Host() {
+            @Override
+            public void onEnterArena(String nickname, String address, long attemptId) {
+                Log.i(TAG, "Home: enter arena " + address + " as '" + nickname
+                        + "' (attempt " + attemptId + ")");
+                nativeEnterArena(nickname, address, attemptId);
+            }
+
+            @Override
+            public void onEnterAiMode(String nickname) {
+                Log.i(TAG, "Lobby: enter offline AI mode as '" + nickname + "'");
+                nativeEnterAiMode(nickname);
+            }
+
+            @Override
+            public void onEnterAiLayoutEditor(String nickname) {
+                nativeEnterAiLayoutEditor(nickname);
+            }
+
+            @Override
+            public void onExitAiLayoutEditor() {
+                nativeExitAiLayoutEditor();
+            }
+
+            @Override
+            public void onSetEditorBare(boolean bare) {
+                nativeSetEditorBare(bare);
+            }
+
+            @Override
+            public void onSetEditorAssist(boolean on) {
+                nativeSetEditorAssist(on);
+            }
+
+            @Override
+            public void onToggleEditorLeaderboard() {
+                nativeToggleEditorLeaderboard();
+            }
+
+            @Override
+            public void onSetNickname(String nickname) {
+                nativeSetNickname(nickname == null ? "" : nickname);
+            }
+
+            @Override
+            public void onSelectArena(String address) {
+                Log.i(TAG, "Home: arena selected " + address);
+                nativeSelectArena(address);
+            }
+
+            @Override
+            public void onArenaTheme(int[] colours, boolean dark) {
+                nativeSetArenaTheme(colours, dark);
+            }
+
+            @Override
+            public void onPickPhoto() {
+                pickProfilePhoto();
+            }
+
+            @Override
+            public String onReadSettings() {
+                return nativeSettingsSnapshot();
+            }
+
+            @Override
+            public String onReadHotkeys() {
+                return nativeHotkeysSnapshot();
+            }
+
+            @Override
+            public String onReadKeyOptions() {
+                return nativeKeyOptions();
+            }
+
+            @Override
+            public String onReadSettingsVersion() {
+                return nativeSettingsVersion();
+            }
+
+            @Override
+            public void onSetAutoRespawn(boolean on) {
+                nativeSetAutoRespawn(on);
+            }
+
+            @Override
+            public void onWriteSetting(String id, float[] values) {
+                nativeSetSetting(id,
+                        values.length > 0 ? values[0] : 0f,
+                        values.length > 1 ? values[1] : 0f,
+                        values.length > 2 ? values[2] : 0f,
+                        values.length > 3 ? values[3] : 0f,
+                        values.length);
+            }
+
+            @Override
+            public void onWriteHotkey(int action, int key, int mode, boolean visible,
+                                      float x, float y) {
+                nativeSetHotkey(action, key, mode, visible, x, y);
+            }
+
+            @Override
+            public void onSettingsAction(int action) {
+                nativeSettingsAction(action);
+            }
+
+            @Override
+            public String onReadPresence() {
+                return nativeTeamPresence();
+            }
+
+            @Override
+            public void onWriteTeamMembers(String packed) {
+                nativeSetTeamMembers(packed);
+            }
+
+            @Override
+            public void onWriteTeamChat(String packed) {
+                try { nativeSetTeamChat(packed); } catch (UnsatisfiedLinkError ignored) { }
+            }
+
+            /**
+             * The chat panel closing, and the snake coming back.
+             *
+             * The engine keeps the bot for a few more seconds and counts them
+             * down on screen, so the player is never handed a snake they were
+             * not looking at.
+             */
+            @Override
+            public void onCloseTeamChat(float seconds) {
+                nativeCloseTeamChat(seconds);
+                // The panel put the interface layer up; nothing else will take
+                // it down, and leaving it up is what dropped the player back
+                // into the menu instead of the match they never left.
+                setTeamChatFromNative(false);
+            }
+
+            @Override
+            public String onReadUpdate() {
+                return nativeUpdateSnapshot();
+            }
+
+            @Override
+            public void onUpdateAction(int action) {
+                nativeUpdateAction(action);
+            }
+
+            @Override
+            public void onBackupAction(int action) {
+                // Native owns the current user_settings bytes. Keeping these
+                // actions beside update actions means a backup always captures
+                // the same in-memory state the next update would protect.
+                nativeUpdateAction(action + 2);
+            }
+
+            /**
+             * Compose asking for the phone to turn.
+             *
+             * The layout editors are the only Compose screens that want
+             * landscape, and they want it while the engine is still sitting on
+             * the title screen — so orientation cannot be decided by the
+             * engine's screen alone any more.
+             */
+            @Override
+            public void onRequestLandscape(boolean landscape) {
+                // Playing upright (Settings › Controls › Play orientation):
+                // the engine's screens stay portrait like everything else.
+                runOnUiThread(() -> setRequestedOrientation(landscape
+                        && !io.david.mobile.data.PlayOrientation.INSTANCE.getPortrait()
+                        ? ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                        : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT));
+            }
+
+            @Override
+            public void onOpenLobby() {
+                Log.i(TAG, "Home: enter lobby");
+                nativeOpenScreen(SCREEN_LOBBY);
+            }
+
+            @Override
+            public void onLeaveLobby() {
+                nativeOpenScreen(SCREEN_TITLE);
+            }
+
+            @Override
+            public void onOpenSkinEditor() {
+                Log.i(TAG, "Home: open skin editor");
+                nativeOpenScreen(SCREEN_SKIN_EDITOR);
+            }
+
+            @Override
+            public void onSkinPreset(int index) {
+                nativeSkinSetPreset(index);
+            }
+
+            @Override
+            public void onSkinCode(String code, int[] colors) {
+                // Colours are positional, so they go first: the engine clears
+                // any previous mixture when a code arrives without them.
+                nativeSkinSetColors(colors);
+                // An empty pattern is not a skin; the engine falls back to the
+                // chosen preset, and saying so here keeps the two in step.
+                nativeSkinSetCode(code);
+                nativeSkinSetMode(!code.isEmpty());
+            }
+
+            @Override
+            public void onSkinSync(boolean save) {
+                nativeSkinSync(save);
+            }
+
+            @Override
+            public void onStudioSet(String path, String text) {
+                try {
+                    nativeStudioSet(path, text);
+                } catch (UnsatisfiedLinkError ignored) {
+                }
+            }
+
+            @Override
+            public void onSkinBackground(int index) {
+                nativeSkinSetBackground(index);
+            }
+
+            @Override
+            public void onSkinAccessory(int id) {
+                nativeSkinSetAccessory(id);
+            }
+
+            @Override
+            public void onSkinCommit() {
+                nativeSkinCommit();
+            }
+
+            @Override
+            public void onDeathPlay() {
+                Log.i(TAG, "Death: play again");
+                nativeDeathPlay();
+            }
+
+            @Override
+            public void onDeathHome() {
+                Log.i(TAG, "Death: back to home");
+                nativeDeathHome();
+            }
+
+            @Override
+            public void onSkinLayout(float previewCentreY, float previewScale,
+                                     float accessoryX, float accessoryY,
+                                     float accessoryCell, float accessoryGap) {
+                nativeSkinSetLayout(previewCentreY, previewScale,
+                        accessoryX, accessoryY, accessoryCell, accessoryGap);
+            }
+
+            @Override
+            public void onSkinPostcard(boolean on) {
+                nativeSkinSetPostcard(on);
+            }
+
+            @Override
+            public void onGameModeEligible(boolean eligible) {
+                if (gameMode != null) gameMode.setEligible(eligible);
+            }
+        });
+        dispatchNotificationIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        dispatchNotificationIntent(intent);
+    }
+
+    private void dispatchNotificationIntent(Intent intent) {
+        if (overlay == null || intent == null) return;
+        String kind = intent.getStringExtra("dvd.kind");
+        if (kind == null || kind.isEmpty()) return;
+        overlay.openFromNotification(
+                kind,
+                safe(intent.getStringExtra("dvd.id")),
+                safe(intent.getStringExtra("dvd.actorId")),
+                safe(intent.getStringExtra("dvd.action")),
+                safe(intent.getStringExtra("dvd.address")));
+        intent.removeExtra("dvd.kind");
+        intent.removeExtra("dvd.id");
+        intent.removeExtra("dvd.actorId");
+        intent.removeExtra("dvd.action");
+        intent.removeExtra("dvd.address");
+    }
+
+    /** Any touch keeps presence from going idle (2026-10-09). */
+    @Override
+    public boolean dispatchTouchEvent(android.view.MotionEvent event) {
+        if (overlay != null) overlay.onUserTouch();
+        return super.dispatchTouchEvent(event);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (gameMode != null) gameMode.onResume();
+        io.david.mobile.data.DvdPerformance.INSTANCE.onResume(this);
+        io.david.mobile.data.DropWatch.watchNetwork(this, true);
+        if (overlay != null) overlay.onActivityResumed();
+        if (updateManager != null) {
+            updateManager.resumePendingInstall();
+        }
+    }
+
+    /* Background play (OM, 2026-10-13): out of sight, the engine stops drawing
+     * and keeps the match running; the service keeps the phone awake for it. */
+    @Override
+    protected void onStart() {
+        super.onStart();
+        backgrounded = false;
+        setBackgroundPlay(false);
+        BackgroundPlayService.stop(this);
+    }
+
+    @Override
+    protected void onStop() {
+        backgrounded = true;
+        setBackgroundPlay(true);
+        if (engineScreen == SCREEN_PLAYING) BackgroundPlayService.start(this);
+        super.onStop();
+    }
+
+    private static void setBackgroundPlay(boolean on) {
+        try {
+            nativeSetBackgroundPlay(on);
+        } catch (Throwable ignored) {
+            // The engine library is not loaded (startup failed): nothing runs anyway.
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        if (gameMode != null) gameMode.onPause();
+        io.david.mobile.data.DvdPerformance.INSTANCE.onPause();
+        io.david.mobile.data.DropWatch.watchNetwork(this, false);
+        if (overlay != null) {
+            overlay.onActivityPaused();
+            // The account keeps a current copy of the settings (AccountSync).
+            overlay.onAppBackground();
+        }
+        super.onPause();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        // Compose launchers (the Trails studio's picker and camera) first.
+        if (overlay != null && overlay.dispatchActivityResult(requestCode, resultCode, data)) {
+            return;
+        }
+        if (requestCode == REQUEST_PROFILE_PHOTO) {
+            Uri picked = resultCode == Activity.RESULT_OK && data != null ? data.getData() : null;
+            if (picked != null) {
+                decodeProfilePhoto(picked);
+            }
+            return;
+        }
+        super.onActivityResult(requestCode, resultCode, data);
+    }
+
+    /**
+     * Asks the system for one image.
+     *
+     * OPEN_DOCUMENT rather than a storage permission: the picker hands back a
+     * single readable image and nothing else, so Dvd never asks to read the
+     * gallery and never can.
+     */
+    private void pickProfilePhoto() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/*");
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/png", "image/jpeg"});
+        try {
+            startActivityForResult(intent, REQUEST_PROFILE_PHOTO);
+        } catch (Exception unavailable) {
+            Log.w(TAG, "No image picker on this device", unavailable);
+            if (overlay != null) overlay.onPhotoPicked(null);
+        }
+    }
+
+    /**
+     * Reads the chosen image at a workable size.
+     *
+     * A modern phone camera produces something far larger than any screen can
+     * show, and decoding it whole would be several hundred megabytes of bitmap
+     * for a picture that ends up 512 pixels square. This samples it down on the
+     * way in, off the main thread, and hands the interface something it can
+     * hold.
+     */
+    private void decodeProfilePhoto(Uri source) {
+        photoExecutor.execute(() -> {
+            Bitmap decoded = null;
+            try {
+                BitmapFactory.Options bounds = new BitmapFactory.Options();
+                bounds.inJustDecodeBounds = true;
+                try (InputStream probe = getContentResolver().openInputStream(source)) {
+                    BitmapFactory.decodeStream(probe, null, bounds);
+                }
+                int longest = Math.max(bounds.outWidth, bounds.outHeight);
+                BitmapFactory.Options options = new BitmapFactory.Options();
+                options.inSampleSize = 1;
+                while (longest / options.inSampleSize > MAX_PHOTO_PIXELS) options.inSampleSize *= 2;
+                try (InputStream stream = getContentResolver().openInputStream(source)) {
+                    decoded = BitmapFactory.decodeStream(stream, null, options);
+                }
+            } catch (Throwable failure) {
+                Log.w(TAG, "Could not read the chosen image", failure);
+            }
+            final Bitmap photo = decoded;
+            runOnUiThread(() -> {
+                if (overlay != null) overlay.onPhotoPicked(photo);
+            });
+        });
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions,
+                                           int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (overlay != null && overlay.dispatchPermissionResult(requestCode, permissions, grantResults)) {
+            return;
+        }
+        if (requestCode == REQUEST_POST_NOTIFICATIONS) {
+            if (overlay != null) overlay.onNotificationPermissionChanged();
+            return;
+        }
+        if (requestCode == REQUEST_RECORD_AUDIO) {
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (overlay != null) overlay.onVoiceMicrophonePermission(granted);
+            return;
+        }
+        if (requestCode != REQUEST_LEGACY_STORAGE) {
+            return;
+        }
+        boolean granted = grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        emitUpdateState(granted ? UPDATE_READY_TO_INSTALL : UPDATE_ERROR, 100,
+                granted ? "Storage access granted" : "Storage access denied",
+                granted
+                        ? "Tap Download & Install again to finish the verified update."
+                        : "Shared Downloads access is required on this Android version.",
+                0L, "");
+    }
+
+    @Override
+    protected void onDestroy() {
+        // The engine must read SDL's quit (it does not read events in the background).
+        setBackgroundPlay(false);
+        BackgroundPlayService.stop(this);
+        if (overlay != null) {
+            overlay.onActivityDestroyed();
+            overlay = null;
+        }
+        if (updateManager != null) {
+            updateManager.shutdown();
+        }
+        photoExecutor.shutdownNow();
+        if (displayRateListener != null) {
+            android.hardware.display.DisplayManager displays =
+                    (android.hardware.display.DisplayManager) getSystemService(DISPLAY_SERVICE);
+            if (displays != null) displays.unregisterDisplayListener(displayRateListener);
+            displayRateListener = null;
+        }
+        super.onDestroy();
+    }
+
+    @Override
+    @SuppressWarnings("deprecation")
+    public void onBackPressed() {
+        if (overlay != null && overlay.consumeSystemBack()) {
+            return;
+        }
+        super.onBackPressed();
+    }
+
+    /**
+     * The channel Dvd's pushes arrive on, and the permission Android 13+
+     * gates it behind.
+     *
+     * Created unconditionally rather than lazily on first push: a channel
+     * created after the user has already found and muted "Dvd alerts" would
+     * silently start showing again, which is worse than asking once, early,
+     * with nothing to show for it yet.
+     */
+    private void ensureNotificationsReady() {
+        DvdMessagingService.ensureChannels(this);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                    new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                    REQUEST_POST_NOTIFICATIONS);
+        }
+    }
+
+    boolean hasLegacyStoragePermission() {
+        return Build.VERSION.SDK_INT >= 29
+                || checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    void requestLegacyStoragePermission() {
+        if (Build.VERSION.SDK_INT < 29) {
+            runOnUiThread(() -> requestPermissions(
+                    new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                    REQUEST_LEGACY_STORAGE));
+        }
+    }
+
+    void emitUpdateState(int status, int progress, String title, String detail,
+                         long versionCode, String versionName) {
+        nativeOnUpdateState(status, Math.max(0, Math.min(100, progress)),
+                safe(title), safe(detail), versionCode, safe(versionName));
+    }
+
+    /** Called once the engine has finished starting; avoids startup-touch races. */
+    public static void notifyTitleScreenReadyFromNative(byte[] settingsPayload) {
+        final byte[] currentSettings = settingsPayload == null
+                ? null : settingsPayload.clone();
+        withActivity(activity -> activity.runOnUiThread(() -> {
+            if (!activity.titleScreenReady) {
+                activity.titleScreenReady = true;
+                if (activity.updateManager != null) {
+                    activity.updateManager.onTitleScreenReady(currentSettings);
+                }
+                // Skin Studio: the engine needs the worn Studio skin each time it starts.
+                if (activity.overlay != null) activity.overlay.onEngineStarted();
+            }
+        }));
+    }
+
+    /**
+     * The engine reporting which layer owns the screen.
+     *
+     * Compose is visible exactly when the engine has nothing of its own to draw,
+     * so the two can never both be live and a tap on Home has nothing
+     * underneath it to fall through to. Orientation rides along: Home is
+     * portrait, and everything the engine draws — the arena, the arena picker,
+     * the skin editor — is landscape.
+     */
+    public static void setScreenFromNative(int screen) {
+        engineScreen = screen;
+        // The match ended while Dvd was in the background: nothing to keep running.
+        if (screen != SCREEN_PLAYING) withActivity(activity -> activity.runOnUiThread(() -> {
+            if (activity.backgrounded) BackgroundPlayService.stop(activity);
+        }));
+        final boolean isLobby = screen == SCREEN_LOBBY;
+        final boolean composeOwns =
+                screen == SCREEN_TITLE || screen == SCREEN_SKIN_EDITOR || isLobby;
+        /*
+         * The lobby is a Compose screen that wants the phone sideways while the
+         * engine is still sitting on the title screen, waiting to be told to
+         * connect. Deciding orientation from the engine's screen alone turned
+         * pressing Play into portrait, then landscape again a moment later — so
+         * the rotation landed on top of admission after all, which is the one
+         * thing the lobby exists to prevent. It also yanked the route back to
+         * Home mid-entry.
+         */
+        withActivity(activity -> activity.runOnUiThread(() -> {
+            /* Asked here rather than tracked in a flag, because a flag has a
+             * lifetime and this question does not: Compose always knows where
+             * the player currently is, and the engine's screen alone does not.
+             * Read on the UI thread, which is where that state lives. */
+            final boolean keepLandscape = activity.overlay != null
+                    && activity.overlay.wantsLandscape();
+            final boolean layoutEditor = activity.overlay != null
+                    && activity.overlay.isLayoutEditorActive();
+            final boolean editorReturned = screen == SCREEN_TITLE
+                    && activity.overlay != null
+                    && activity.overlay.consumeLayoutEditorExit();
+            final boolean upright = io.david.mobile.data.PlayOrientation.INSTANCE.getPortrait();
+            activity.setRequestedOrientation((composeOwns && !keepLandscape) || upright
+                    ? ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    : ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+            if (activity.overlay != null) {
+                activity.overlay.onPresenceScreen(screen);
+                // A run is starting: the last one can no longer be shared.
+                if (screen == SCREEN_PLAYING) activity.overlay.clearLastRun();
+                if (isLobby) {
+                    activity.overlay.showRoute(DvdOverlay.Route.LOBBY);
+                } else if (composeOwns && !keepLandscape && !editorReturned) {
+                    activity.overlay.showRoute(screen == SCREEN_SKIN_EDITOR
+                            ? DvdOverlay.Route.SKIN_EDIT
+                            : DvdOverlay.Route.HOME);
+                }
+                activity.overlay.setInterfaceVisible(composeOwns || layoutEditor);
+            }
+            if (activity.gameMode != null) {
+                activity.gameMode.setGameplay(!composeOwns);
+            }
+            if (!composeOwns) {
+                activity.restoreNativeSurfaceFocus();
+            }
+        }));
+    }
+
+    public static void setArenaPortAvailableFromNative(boolean available) {
+        withActivity(activity -> activity.runOnUiThread(() -> {
+            if (activity.overlay != null) activity.overlay.onArenaPortAvailable(available);
+        }));
+    }
+
+    /** The engine declined a Play without dialling; see DvdOverlay.onArenaEnterIgnored. */
+    public static void setArenaEnterIgnoredFromNative() {
+        withActivity(activity -> {
+            if (activity.overlay != null) activity.overlay.onArenaEnterIgnored();
+        });
+    }
+
+    /**
+     * The engine reporting that the in-game chat button was pressed.
+     *
+     * Not a change of screen: the arena carries on, the bot is already
+     * steering, and only the interface layer changes.
+     */
+    public static void setTeamChatFromNative(boolean shown) {
+        withActivity(activity -> activity.runOnUiThread(() -> {
+            if (activity.overlay == null) return;
+            activity.overlay.setArenaChat(shown);
+            activity.overlay.setInterfaceVisible(shown);
+            if (!shown) activity.restoreNativeSurfaceFocus();
+        }));
+    }
+
+    /**
+     * The death card, raised and dropped by the engine.
+     *
+     * Not routed through {@link #setScreenFromNative}: the engine is still on
+     * PLAYING, the phone stays landscape, and the arena carries on rendering
+     * behind the card with the bot at the controls. Only the interface changes.
+     */
+    public static void setDeathFromNative(boolean shown, int score, int kills,
+                                          double playTimeSeconds,
+                                          boolean autoRespawn) {
+        withActivity(activity -> activity.runOnUiThread(() -> {
+            if (activity.overlay == null) return;
+            activity.overlay.setDeath(shown, score, kills, playTimeSeconds,
+                                      autoRespawn);
+            activity.overlay.setInterfaceVisible(shown);
+            if (!shown) {
+                activity.restoreNativeSurfaceFocus();
+            }
+        }));
+    }
+
+    /** Native arena geometry keeps the small voice surface beside the minimap. */
+    public static void setVoiceHudAnchorFromNative(float left, float top, float diameter) {
+        withActivity(activity -> {
+            if (activity.overlay != null) {
+                activity.overlay.setVoiceHudAnchor(left, top, diameter);
+            }
+        });
+    }
+
+    /** Starts the microphone consent only from the visible Voice Chat screen. */
+    public void requestVoiceMicrophonePermission() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED) {
+            if (overlay != null) overlay.onVoiceMicrophonePermission(true);
+            return;
+        }
+        requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+    }
+
+    /**
+     * A finished run exists independently of whether Auto Respawn shows a card.
+     * The arena is still on screen for about 1.6 s after a death, so the run's
+     * screenshot for "Share run" is taken here too.
+     */
+    public static void recordRunFromNative(int score, int kills, double playTimeSeconds) {
+        withActivity(activity -> activity.runOnUiThread(() -> {
+            if (activity.overlay != null) {
+                final int run = activity.overlay.recordRunFromNative(score, kills, playTimeSeconds);
+                activity.captureRunScreenshot(run);
+            }
+        }));
+    }
+
+    /**
+     * One copy of SDL's surface, the long side at most 1440 px. Any failure
+     * (no surface, a protected buffer, no memory) simply means no screenshot.
+     */
+    private void captureRunScreenshot(final int run) {
+        final SurfaceView surface = mSurface;
+        if (surface == null || overlay == null) return;
+        final int width = surface.getWidth();
+        final int height = surface.getHeight();
+        if (width <= 0 || height <= 0 || !surface.getHolder().getSurface().isValid()) return;
+        final float scale = Math.min(1f, 1440f / Math.max(width, height));
+        final Bitmap shot;
+        try {
+            shot = Bitmap.createBitmap(Math.max(1, Math.round(width * scale)),
+                    Math.max(1, Math.round(height * scale)), Bitmap.Config.ARGB_8888);
+        } catch (OutOfMemoryError | IllegalArgumentException e) {
+            return;
+        }
+        try {
+            PixelCopy.request(surface, shot, result -> {
+                if (result == PixelCopy.SUCCESS && overlay != null) {
+                    overlay.setRunScreenshot(run, shot);
+                } else {
+                    shot.recycle();
+                }
+            }, new Handler(Looper.getMainLooper()));
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Share run: no screenshot", e);
+            shot.recycle();
+        }
+    }
+
+    /** The engine's palette and preset table, sent once. */
+    public static void setSkinTablesFromNative(int[] palette, byte[] codeChars,
+                                               byte[] presets) {
+        withActivity(activity -> {
+            if (activity.overlay != null) {
+                activity.overlay.updateSkinTables(palette, codeChars, presets);
+            }
+        });
+    }
+
+    /**
+     * The engine saying which snake is ours in which arena, or that we are no
+     * longer in one. A snake id of -1 is the signal to stop publishing.
+     */
+    public static void publishArenaSkinFromNative(String arena, int snakeId, String nickname) {
+        final String safeArena = safe(arena);
+        final String safeNickname = safe(nickname);
+        withActivity(activity -> {
+            if (activity.overlay != null) {
+                // A new life (Auto Respawn stays on PLAYING): the last run is no longer the one to share.
+                if (snakeId >= 0) activity.overlay.clearLastRun();
+                activity.overlay.publishArenaSkin(safeArena, snakeId, safeNickname);
+            }
+        });
+    }
+
+    /** Snakes now in view that Dvd has not yet been asked about. */
+    public static void requestArenaSkinsFromNative(int[] snakeIds) {
+        final int[] safeIds = snakeIds != null ? snakeIds : new int[0];
+        withActivity(activity -> {
+            if (activity.overlay != null) activity.overlay.requestArenaSkins(safeIds);
+        });
+    }
+
+    /** What is currently worn. */
+    public static void setSkinStateFromNative(boolean custom, int preset,
+                                              String code, int accessory,
+                                              int[] colors, int background) {
+        final String safeCode = safe(code);
+        final int[] safeColors = colors != null ? colors : new int[0];
+        withActivity(activity -> {
+            if (activity.overlay != null) {
+                activity.overlay.updateSkinState(custom, preset, safeCode, accessory,
+                                                 safeColors, background);
+            }
+        });
+    }
+
+    /** The engine handing Compose the values it persists. */
+    public static void setHomeStateFromNative(String nickname, String arena,
+                                              int score, int kills) {
+        final String safeNickname = safe(nickname);
+        final String safeArena = safe(arena);
+        withActivity(activity -> {
+            if (activity.overlay == null) return;
+            activity.overlay.updateProfile(safeNickname, score, kills);
+            activity.overlay.updateArena(
+                    safeArena.isEmpty() ? "Choose arena" : safeArena,
+                    !safeArena.isEmpty());
+        });
+    }
+
+    /**
+     * An arena that would not take us, and how many seconds to remember it for.
+     *
+     * Called by app/src/platform/android_home.c when a connect attempt runs past
+     * its time. The picker cannot work this out for itself: a refusing arena
+     * answers the TCP ping it is measured by perfectly well.
+     */
+    public static void setArenaRefusedFromNative(String arena, int seconds) {
+        final String safeArena = safe(arena);
+        if (safeArena.isEmpty() || seconds <= 0) return;
+        withActivity(activity -> {
+            if (activity.overlay == null) return;
+            activity.overlay.arenaRefused(safeArena, seconds);
+        });
+    }
+
+    /**
+     * Called by app/src/platform/android_home.c when the arena dropped a live
+     * snake (not a death, not the player leaving). `packed` is `key=value`
+     * lines; DropWatch adds the network facts and asks about a report.
+     * Engine thread: the overlay hops to the UI thread.
+     */
+    public static void setArenaDropFromNative(String packed) {
+        final String safePacked = safe(packed);
+        if (safePacked.isEmpty()) return;
+        withActivity(activity -> {
+            try {
+                if (activity.overlay != null) activity.overlay.onArenaDrop(safePacked);
+            } catch (RuntimeException error) {
+                Log.w(TAG, "arena drop not recorded", error);
+            }
+        });
+    }
+
+    /** Called by app/src/platform/android_update.c. */
+    public static void checkForUpdatesFromNative() {
+        withActivity(activity -> activity.runOnUiThread(() -> {
+            if (activity.updateManager != null) {
+                activity.updateManager.checkForUpdates(true);
+            }
+        }));
+    }
+
+    public static void downloadAvailableUpdateFromNative(byte[] payload,
+                                                         byte[] unused) {
+        if (payload == null) {
+            return;
+        }
+        byte[] copy = payload.clone();
+        withActivity(activity -> activity.runOnUiThread(() -> {
+            if (activity.updateManager != null) {
+                activity.updateManager.downloadAvailableUpdate(copy);
+            }
+        }));
+    }
+
+    /*
+     * The engine still knows the four backup calls by name (android_update.c).
+     * Manual backups are retired (2026-10-01), so they do nothing; nothing in
+     * the interface asks for them any more.
+     */
+    public static void createBackupFromNative(byte[] payload, byte[] unused) { }
+
+    public static void checkBackupsFromNative() { }
+
+    public static void restoreLatestBackupFromNative() { }
+
+    public static void chooseBackupFolderFromNative() { }
+
+    private static void withActivity(ActivityAction action) {
+        Activity context = SDLActivity.getContext();
+        if (context instanceof DvdActivity) {
+            action.run((DvdActivity) context);
+        }
+    }
+
+    private static String safe(String value) {
+        return value == null ? "" : value;
+    }
+
+    /**
+     * Settings › Performance. Vsync is on in every mode (OM, 2026-10-12, "same
+     * to same the reference client"): FIFO paces every frame. The engine's surface asks the
+     * display for the policy's rate with CHANGE_FRAME_RATE_ALWAYS, up or down,
+     * so a limit is held by the display itself (Android 15 keeps a game at
+     * 60 Hz until it asks). The engine's own cap (a sleep, a second clock on
+     * top of vsync that made heavy frames repeat) runs only while the display
+     * still shows more than the limit: a phone that refused the switch.
+     */
+    private void applyFramePolicy(boolean vsync, int cap, float displayHz, boolean raising) {
+        framePolicyCap = cap;
+        pushEngineFramePolicy();
+        Log.i(TAG, "Performance: cap=" + cap + " display=" + displayHz + " Hz");
+        frameRateHz = displayHz;
+        frameRateHandler.removeCallbacks(frameRateRequest);
+        frameRateHandler.post(frameRateRequest);
+        watchDisplayRate();
+    }
+
+    private int framePolicyCap;
+    private int sentEngineCap = -1;
+
+    private float currentRefreshRate() {
+        try {
+            android.view.Display display = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                    ? getDisplay() : getWindowManager().getDefaultDisplay();
+            return display == null ? 0f : display.getRefreshRate();
+        } catch (RuntimeException e) {
+            return 0f;
+        }
+    }
+
+    /** Vsync always; the engine's cap only while the display runs faster than the limit. */
+    private void pushEngineFramePolicy() {
+        float actual = currentRefreshRate();
+        int engineCap = framePolicyCap > 0 && (actual <= 0f || actual > framePolicyCap + 2f)
+                ? framePolicyCap : 0;
+        if (engineCap == sentEngineCap) return;
+        try {
+            nativeSetFramePolicy(true, engineCap);
+        } catch (UnsatisfiedLinkError ignored) {
+            return;
+        }
+        sentEngineCap = engineCap;
+        Log.i(TAG, "Performance: display " + actual + " Hz, engine cap " + engineCap);
+    }
+
+    private android.hardware.display.DisplayManager.DisplayListener displayRateListener;
+
+    /** The display answers setFrameRate later: follow its real rate. */
+    private void watchDisplayRate() {
+        if (displayRateListener != null) return;
+        android.hardware.display.DisplayManager displays =
+                (android.hardware.display.DisplayManager) getSystemService(DISPLAY_SERVICE);
+        if (displays == null) return;
+        displayRateListener = new android.hardware.display.DisplayManager.DisplayListener() {
+            @Override public void onDisplayAdded(int displayId) { }
+            @Override public void onDisplayRemoved(int displayId) { }
+            @Override public void onDisplayChanged(int displayId) { pushEngineFramePolicy(); }
+        };
+        displays.registerDisplayListener(displayRateListener, frameRateHandler);
+    }
+
+    private final Handler frameRateHandler = new Handler(Looper.getMainLooper());
+    private float frameRateHz;
+    private int frameRateTries;
+    private final Runnable frameRateRequest = new Runnable() {
+        @Override
+        public void run() {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || frameRateHz <= 0f) return;
+            final SurfaceView surface = mSurface;
+            android.view.Surface target = surface == null ? null : surface.getHolder().getSurface();
+            if (target == null || !target.isValid()) {
+                // The surface is still being made (start, back from the background).
+                if (frameRateTries++ < 20) frameRateHandler.postDelayed(this, 250);
+                return;
+            }
+            frameRateTries = 0;
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    target.setFrameRate(frameRateHz, android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+                            android.view.Surface.CHANGE_FRAME_RATE_ALWAYS);
+                } else {
+                    target.setFrameRate(frameRateHz, android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+                }
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Performance: setFrameRate refused", e);
+            }
+        }
+    };
+
+    private void restoreNativeSurfaceFocus() {
+        if (mSurface == null) return;
+        final View surface = mSurface;
+        surface.setFocusable(true);
+        surface.setFocusableInTouchMode(true);
+        surface.requestFocus();
+        surface.post(surface::requestFocus);
+    }
+
+    private interface ActivityAction {
+        void run(DvdActivity activity);
+    }
+}
