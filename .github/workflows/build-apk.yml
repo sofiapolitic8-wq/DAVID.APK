@@ -21,26 +21,26 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Android SDK platform, NDK and CMake
-        shell: bash
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # ONE package only. This input is split on spaces, never on new lines, so a
+          # multi-line list is read as a single package name and fails with
+          # "Failed to find package". The rest is installed in the next step.
+          packages: platform-tools
+
+      - name: Install Android SDK, NDK and CMake
         run: |
-          # The runner image already ships the Android SDK; use its own sdkmanager.
-          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          test -x "$SDKM" || SDKM="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | head -1)"
-          echo "using $SDKM"
-          yes | "$SDKM" --licenses >/dev/null || true
-          "$SDKM" 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
 
       - name: Install Slang shader compiler
         shell: bash
